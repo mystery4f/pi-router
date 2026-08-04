@@ -5,6 +5,20 @@ All notable changes to pi-router will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-04
+
+### Changed
+
+- **Pi 0.83 compatibility**: aligned development and peer dependencies with pi `0.83.0`, switched legacy `pi-ai` imports to the supported `compat`/`providers/all` entry points, and changed TypeScript module resolution to `bundler` for package exports.
+- **Runtime provider dispatch**: route upstream requests through pi's effective provider registry when available, preserving provider-owned authentication and streaming implementations.
+- **Agent directory alignment**: follow pi's `PI_CODING_AGENT_DIR` setting instead of assuming `~/.pi/agent`.
+- **Session resource lifecycle**: defer auto-sync and health-probe timers until `session_start` and clean them up on `session_shutdown`.
+- **Node.js requirement**: raised the supported runtime to Node.js `22.19+`, matching pi `0.83`.
+
+### Tests
+
+- Added regression coverage for pi runtime provider dispatch and custom agent directories.
+
 ## [0.4.3] - 2026-07-01
 
 ### Changed

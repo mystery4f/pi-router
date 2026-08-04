@@ -1,18 +1,18 @@
 /**
- * pi-router v0.4.0
+ * pi-router v0.5.0
  * Intelligent routing layer for pi coding agent
  *
  * Routes channels (same model, different providers) with optional fallback models.
  * Real model identity end-to-end — zero protocol coupling with pi-cache-optimizer.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, SelectList, Text, truncateToWidth, visibleWidth, type SelectItem } from "@earendil-works/pi-tui";
-import { getModels as getBuiltinPiAiModels, streamSimple, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { getBuiltinModels as getBuiltinPiAiModels } from "@earendil-works/pi-ai/providers/all";
+import { streamSimple, createAssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
 import type { Model, Api, Context, SimpleStreamOptions, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "@earendil-works/pi-ai";
 import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
 import * as crypto from "crypto";
 import { runConfigOrderWizard, runConfigWizard } from "./config-wizard-flow.js";
 import {
@@ -49,10 +49,22 @@ type PiModel = {
   headers?: Record<string, string>;
   compat?: Record<string, unknown>;
   reasoning?: boolean;
-  thinkingLevelMap?: Record<string, string>;
+  thinkingLevelMap?: Record<string, string | null>;
   contextWindow?: number;
   maxTokens?: number;
-  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  cost?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    tiers?: Array<{
+      inputTokensAbove: number;
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+    }>;
+  };
   input?: string[];
   deprecated?: boolean;
   status?: string;
@@ -385,7 +397,9 @@ let piConfigDirOverride: string | null = null;
  * Get pi config directory
  */
 function getPiConfigDir(): string {
-  return piConfigDirOverride || path.join(os.homedir(), ".pi", "agent");
+  // Keep pi-router aligned with pi when PI_CODING_AGENT_DIR points to a
+  // non-default agent directory. Tests can still inject an isolated path.
+  return piConfigDirOverride || getAgentDir();
 }
 
 /**
@@ -393,6 +407,29 @@ function getPiConfigDir(): string {
  */
 function getModelsJsonPath(): string {
   return path.join(getPiConfigDir(), "models.json");
+}
+
+function getExplicitlyDisabledProviders(): Set<string> {
+  const modelsPath = getModelsJsonPath();
+  if (!fs.existsSync(modelsPath)) return new Set();
+
+  try {
+    const data = JSON.parse(fs.readFileSync(modelsPath, "utf-8")) as {
+      providers?: Record<string, { models?: unknown }>;
+    };
+    return new Set(
+      Object.entries(data.providers || {})
+        .filter(([, provider]) => Array.isArray(provider?.models) && provider.models.length === 0)
+        .map(([providerName]) => providerName),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function filterExplicitlyDisabledProviders(models: PiModel[]): PiModel[] {
+  const disabledProviders = getExplicitlyDisabledProviders();
+  return models.filter(model => !disabledProviders.has(model.provider));
 }
 
 // Cache for provider IDs to avoid repeated file system access
@@ -663,7 +700,7 @@ function modelsFromRegistry(modelRegistry: any): PiModel[] | undefined {
 
   try {
     const models = getter() as Array<any>;
-    return models.map((model) => normalizeModelForProvider({
+    const normalizedModels = models.map((model) => normalizeModelForProvider({
       id: model.id,
       name: model.name,
       provider: model.provider,
@@ -682,6 +719,7 @@ function modelsFromRegistry(modelRegistry: any): PiModel[] | undefined {
       state: model.state,
       lifecycle: model.lifecycle,
     }));
+    return filterExplicitlyDisabledProviders(normalizedModels);
   } catch (err) {
     debugLog("[pi-router] Failed to read models from model registry:", err);
     return undefined;
@@ -701,14 +739,31 @@ function filterConfigurableModels(models: PiModel[], allowedProviders: Set<strin
   );
 }
 
+function mergeModelSources(primary: PiModel[], secondary: PiModel[]): PiModel[] {
+  const merged = new Map<string, PiModel>();
+  for (const model of [...primary, ...secondary]) {
+    const key = `${model.id}@${model.provider}`;
+    if (!merged.has(key)) merged.set(key, model);
+  }
+  return Array.from(merged.values());
+}
+
 function getConfigurableModels(modelRegistry?: any, forceRefresh = false): PiModel[] {
   const { authProviders, modelsProviders } = loadProviderIds(forceRefresh);
-  const allowedProviders = new Set<string>([...authProviders, ...modelsProviders]);
   const diskModels = loadModelsJson(forceRefresh);
-  if (diskModels.length > 0) {
-    return filterConfigurableModels(diskModels, allowedProviders);
-  }
-  return filterConfigurableModels(getEffectiveModels(modelRegistry), allowedProviders);
+  const registryModels = modelsFromRegistry(modelRegistry) || [];
+  const allowedProviders = new Set<string>([
+    ...authProviders,
+    ...modelsProviders,
+    ...registryModels.map(model => model.provider),
+  ]);
+
+  // Keep models.json as the authoritative source for duplicate IDs, but add
+  // authenticated/dynamic models contributed by pi 0.83 provider runtimes.
+  return filterConfigurableModels(
+    mergeModelSources(diskModels, registryModels),
+    allowedProviders,
+  );
 }
 
 function buildModelMap(models: PiModel[]): Map<string, PiModel> {
@@ -1222,16 +1277,27 @@ function detectModelChanges(config: RouterConfig, currentModels: PiModel[]): Mod
   return diff;
 }
 
-function getSyncModels(): PiModel[] {
+function getSyncModels(modelRegistry = routerState.currentModelRegistry): PiModel[] {
   const explicitModels = loadExplicitModelsJson();
   const { authProviders, modelsProviders } = loadProviderIds(true);
   const configuredProviders = new Set(modelsProviders);
   const authOnlyModels = authProviders.flatMap((providerName) =>
     configuredProviders.has(providerName) ? [] : expandProviderModels(providerName, {})
   );
-  return filterConfigurableModels(
+  const diskModels = filterConfigurableModels(
     [...explicitModels, ...authOnlyModels],
-    new Set([...modelsProviders, ...authProviders])
+    new Set([...modelsProviders, ...authProviders]),
+  );
+  const runtimeModels = modelRegistry ? modelsFromRegistry(modelRegistry) : undefined;
+  const allowedProviders = new Set([
+    ...modelsProviders,
+    ...authProviders,
+    ...(runtimeModels || []).map(model => model.provider),
+  ]);
+
+  return filterConfigurableModels(
+    mergeModelSources(diskModels, runtimeModels || []),
+    allowedProviders,
   );
 }
 
@@ -1301,14 +1367,14 @@ function refreshConfigFromDisk(config?: RouterConfig): RouterConfig {
 }
 
 /**
- * Load config from ~/.pi/agent/pi-router.json
+ * Load config from pi's configured agent directory
  */
 function loadConfig(): RouterConfig {
   const configPath = getRouterConfigPath();
   
   if (!fs.existsSync(configPath)) {
     debugLog("[pi-router] No config found. Auto-discovery disabled by default.");
-    debugLog("[pi-router] Create ~/.pi/agent/pi-router.json to configure models.");
+    debugLog(`[pi-router] Create ${configPath} to configure models.`);
     debugLog("[pi-router] See examples/router.config.json for reference.");
     return {
       strategy: "channelFirst",
@@ -1342,7 +1408,7 @@ function loadConfig(): RouterConfig {
 }
 
 /**
- * Save config to ~/.pi/agent/pi-router.json
+ * Save config to pi's configured agent directory
  */
 function saveConfig(config: RouterConfig): void {
   const configPath = getRouterConfigPath();
@@ -1369,7 +1435,7 @@ function saveConfig(config: RouterConfig): void {
 function addConfigComments(config: RouterConfig): Record<string, unknown> {
   return {
     _comment_1: "Pi-Router 配置文件。可手动编辑；也可运行 /router config wizard 重新生成。",
-    _comment_2: "配置文件路径: ~/.pi/agent/pi-router.json；修改后运行 /reload 或重启 pi 生效。",
+    _comment_2: `配置文件路径: ${getRouterConfigPath()}；修改后运行 /reload 或重启 pi 生效。`,
     _comment_strategy: "路由策略: channelFirst(通道优先) / custom(自定义顺序)",
     strategy: config.strategy ?? "channelFirst",
     _comment_auto: "是否注册 router/auto 并在无 models 时自动发现多通道模型",
@@ -1513,7 +1579,7 @@ function maybeNotifyHealthProbeCost(ctx: any, config: RouterConfig): void {
     "健康探测已启用\n\n" +
     `pi-router 会每 ${intervalSeconds} 秒向已配置的真实模型发送一次探测消息。` +
     "这些是真实 API 调用，可能产生额外用量/费用。\n\n" +
-    "如需关闭，请将 ~/.pi/agent/pi-router.json 中的 healthProbe.enabled 设为 false，然后运行 /reload。",
+    `如需关闭，请将 ${getRouterConfigPath()} 中的 healthProbe.enabled 设为 false，然后运行 /reload。`,
     "warning"
   );
 }
@@ -1565,7 +1631,7 @@ function showCurrentConfig(ctx: any, config: RouterConfig): void {
   lines.push("");
   lines.push("  auto 模式会按上面的模型顺序依次尝试；某个模型成功后就不会继续往后尝试。");
   lines.push("");
-  lines.push(`配置文件: ~/.pi/agent/pi-router.json`);
+  lines.push(`配置文件: ${getRouterConfigPath()}`);
   lines.push("");
   lines.push("运行 /router config order 调整现有模型/渠道顺序");
   lines.push("运行 /router config wizard 重新跑完整配置向导");
@@ -1597,7 +1663,7 @@ async function confirmReset(ctx: any): Promise<boolean> {
   const result = await ctx.ui.custom((tui: any, theme: any, _kb: any, done: any) => {
     const container = new Container();
     container.addChild(new Text(theme.fg("warning", theme.bold("确认重置 Pi-Router 配置？")), 1, 1));
-    container.addChild(new Text(theme.fg("dim", "此操作会覆盖 ~/.pi/agent/pi-router.json。"), 1, 0));
+    container.addChild(new Text(theme.fg("dim", `此操作会覆盖 ${getRouterConfigPath()}。`), 1, 0));
 
     const selectList = new SelectList(items, items.length, {
       selectedPrefix: (t: string) => theme.fg("accent", t),
@@ -2308,7 +2374,7 @@ let routerHandlerRef: ((args: string, ctx: any) => Promise<void>) | null = null;
  * Main extension export
  *
  * Performance optimization: Lazy load models.json only when needed
- * Auto-sync check is enabled by default and deferred to first use or background (30s after startup).
+ * Auto-sync check is enabled by default and deferred to the first session (30s after session_start).
  * It only checks local models.json/auth.json changes; health probes are controlled by healthProbe.enabled.
  */
 export default function (pi: ExtensionAPI) {
@@ -2356,30 +2422,54 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Early exit if no models configured
-  if (!config.models || config.models.length === 0) {
-    debugLog("[pi-router] No models configured. Create pi-router.json or enable auto-discovery.");
-    return;
+  // Register immediately when static configuration is available. If models are
+  // only exposed by pi's runtime registry, session_start below will complete
+  // registration after provider extensions and dynamic catalogs are ready.
+  if (config.models && config.models.length > 0) {
+    if (!currentModels) {
+      currentModels = loadModelsJson();
+    }
+    registerRouterProvider(pi, config, currentModels);
+  } else {
+    debugLog("[pi-router] No models configured yet. Waiting for session_start auto-discovery or configuration.");
   }
 
-  // Ensure models are loaded for registration
-  if (!currentModels) {
-    currentModels = loadModelsJson();
-  }
-  
-  // Register router provider with mirror entries
-  registerRouterProvider(pi, config, currentModels);
-  
-  // Defer health probes to avoid blocking startup. This is opt-in because
-  // probes send real model requests and may create extra usage/costs.
-  if (config.healthProbe?.enabled === true) {
-    // Start probes after a short delay to not block initialization
-    setTimeout(() => {
-      startHealthProbes(config);
-    }, 1000);
-  }
-  
-  debugLog("[pi-router] Extension loaded (v0.4.0)");
+  // Session-scoped resources are started from session_start. Pi can load an
+  // extension in invocations that never create a session (for example, model
+  // listing), so starting timers in the factory would leak process resources.
+  let autoSyncTimer: NodeJS.Timeout | undefined;
+  let healthProbeStartupTimer: NodeJS.Timeout | undefined;
+  const clearSessionResources = () => {
+    if (autoSyncTimer) {
+      clearTimeout(autoSyncTimer);
+      autoSyncTimer = undefined;
+    }
+    if (healthProbeStartupTimer) {
+      clearTimeout(healthProbeStartupTimer);
+      healthProbeStartupTimer = undefined;
+    }
+    stopHealthProbes();
+  };
+  const scheduleSessionResources = (currentConfig: RouterConfig) => {
+    clearSessionResources();
+    autoSyncChecked = false;
+
+    // This only checks local models.json/auth.json changes. It never calls a
+    // provider; real health requests are controlled by healthProbe.enabled.
+    autoSyncTimer = setTimeout(() => {
+      autoSyncTimer = undefined;
+      checkAutoSyncOnce();
+    }, 30000);
+
+    if (currentConfig.healthProbe?.enabled === true) {
+      // Delay probes until the session context and model registry are ready.
+      healthProbeStartupTimer = setTimeout(() => {
+        healthProbeStartupTimer = undefined;
+        startHealthProbes(currentConfig);
+      }, 1000);
+    }
+  };
+  debugLog("[pi-router] Extension loaded (v0.5.0)");
   debugLog("[pi-router] Strategy:", config.strategy ?? "channelFirst");
   debugLog("[pi-router] Configured models:", config.models?.length ?? 0);
   
@@ -2395,10 +2485,49 @@ export default function (pi: ExtensionAPI) {
   // Remember the active UI context so routing code can update the footer during
   // the same turn, not only at the next turn_start.
   pi.on("session_start", async (_event, ctx) => {
-    const currentConfig = refreshConfigFromDisk(config);
+    let currentConfig = refreshConfigFromDisk(config);
     updateFooterContext(ctx);
+
+    // Pi 0.83 may add models through provider-owned dynamic catalogs or other
+    // extensions. Read the authenticated runtime registry once the session
+    // context is available, and use it for both auto-discovery and mirror
+    // registration. The disk-based load above remains the startup fallback.
+    const registryModels = modelsFromRegistry(ctx.modelRegistry);
+    const registryUpstreamModels = registryModels?.filter(model =>
+      model.provider !== "router" && model.api !== ROUTER_API && !isDeprecatedModel(model)
+    );
+
+    if ((!currentConfig.models || currentConfig.models.length === 0) && currentConfig.auto && registryUpstreamModels?.length) {
+      const groups = groupModelsByChannelsWithAliases(registryUpstreamModels, currentConfig);
+      const autoModels: RouterModelConfig[] = [];
+      for (const [modelId, group] of groups.entries()) {
+        if (group.channels.length > 1) {
+          autoModels.push(createRouterModelConfigFromGroup(modelId, group));
+        }
+      }
+      if (autoModels.length > 0) {
+        currentConfig.models = autoModels;
+        currentConfig.lastSyncHash = calculateSyncSourceHash();
+        saveConfig(currentConfig);
+        debugLog(`[pi-router] Auto-discovered ${autoModels.length} runtime multi-channel models`);
+      }
+    }
+
+    if (currentConfig.models?.length) {
+      const modelsForRegistration = registryModels && registryUpstreamModels?.length
+        ? registryModels
+        : (currentModels || loadModelsJson());
+      currentModels = modelsForRegistration;
+      registerRouterProvider(pi, currentConfig, modelsForRegistration);
+    }
+
+    scheduleSessionResources(currentConfig);
     maybeNotifyHealthProbeCost(ctx, currentConfig);
     applyFooterStatus();
+  });
+
+  pi.on("session_shutdown", async () => {
+    clearSessionResources();
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -2491,12 +2620,6 @@ export default function (pi: ExtensionAPI) {
   
   debugLog("[pi-router] /router command registered");
 
-  // Background auto-sync check (30s after startup as fallback).
-  // This only checks local models.json/auth.json changes. It does not probe
-  // model providers; real health checks are controlled solely by healthProbe.enabled.
-  setTimeout(() => {
-    checkAutoSyncOnce();
-  }, 30000);
 }
 
 /**
@@ -4435,12 +4558,34 @@ async function applyUpstreamRequestAuth(
   const headers = auth.headers || nextOptions?.headers
     ? { ...auth.headers, ...nextOptions?.headers }
     : undefined;
+  // Pi 0.81+ can resolve provider-scoped environment values (for example
+  // Cloudflare account/gateway IDs) alongside the API key. Preserve them when
+  // a request is routed through the virtual provider.
+  const env = auth.env || nextOptions?.env
+    ? { ...auth.env, ...nextOptions?.env }
+    : undefined;
 
   return {
     ...nextOptions,
     ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
     ...(headers ? { headers } : {}),
+    ...(env ? { env } : {}),
   };
+}
+
+function streamThroughProvider(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  // Since pi 0.81, the model registry exposes the effective provider object.
+  // Using it preserves native/extension provider stream implementations; the
+  // compat dispatcher is only a fallback for isolated tests or older embeds.
+  const provider = routerState.currentModelRegistry?.getProvider?.(model.provider);
+  if (provider?.streamSimple) {
+    return provider.streamSimple(model, context, options);
+  }
+  return streamSimple(model, context, options);
 }
 
 function forwardToProvider(
@@ -4481,7 +4626,7 @@ function forwardToProvider(
       delete providerOptions.timeoutMs;
       debugLog(`[pi-router] Forwarding to ${model.provider} streamSimple`);
 
-      const upstreamStream = streamSimple(realModel, hintedRequest.context, providerOptions);
+      const upstreamStream = streamThroughProvider(realModel, hintedRequest.context, providerOptions);
       for await (const event of upstreamStream) {
         eventStream.push(event);
       }
@@ -5771,6 +5916,10 @@ function __testGetCachedModelMap(modelRegistry?: any): Map<string, PiModel> {
   return getCachedModelMap(modelRegistry);
 }
 
+function __testSetCurrentModelRegistry(modelRegistry: any): void {
+  routerState.currentModelRegistry = modelRegistry;
+}
+
 function __testGetConfigurableModels(modelRegistry?: any, forceRefresh = false): PiModel[] {
   return getConfigurableModels(modelRegistry, forceRefresh);
 }
@@ -5847,6 +5996,7 @@ export {
   __testSaveConfig,
   __testRefreshConfigFromDisk,
   __testGetCachedModelMap,
+  __testSetCurrentModelRegistry,
   __testGetConfigurableModels,
   __testGetSyncModels,
   __testRegisterRoutingAdapter,

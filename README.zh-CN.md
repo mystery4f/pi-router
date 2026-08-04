@@ -76,13 +76,15 @@ pi install /path/to/pi-router
 - 官方域名白名单（覆盖 40+ 提供商，包括 Anthropic、OpenAI、Google、DeepSeek、Qwen、GLM、Kimi 等）
 - 本地 URL 检测（`localhost`、`127.0.0.1`）
 
-配置文件路径：
+配置文件使用与 pi 相同的 agent 目录：
 
 ```text
 ~/.pi/agent/pi-router.json
 ```
 
-高级用户可直接编辑配置文件。同时会生成参考说明文件：
+如果设置了 `PI_CODING_AGENT_DIR`，pi-router 也会跟随该目录读取和写入 `models.json`、`auth.json` 与 `pi-router.json`。
+
+当前版本面向 pi `0.83+` 和 Node.js `22.19+`。高级用户可直接编辑配置文件。同时会生成参考说明文件：
 
 ```text
 ~/.pi/agent/pi-router.README.md

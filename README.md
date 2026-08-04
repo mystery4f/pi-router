@@ -46,7 +46,7 @@ pi install git:github.com/jiangge/pi-router
 pi install /path/to/pi-router
 ```
 
-See [INSTALL.md](INSTALL.md) for detailed installation options.
+See [INSTALL.md](INSTALL.md) for detailed installation options. The current release targets pi `0.83+` and Node.js `22.19+`.
 
 ### 2. Configure
 
@@ -76,11 +76,13 @@ Classification is based on:
 - Official domain whitelist (40+ providers including Anthropic, OpenAI, Google, DeepSeek, Qwen, GLM, Kimi, and more)
 - Local URL detection (`localhost`, `127.0.0.1`)
 
-Configuration is stored at:
+Configuration is stored at the same agent directory used by pi:
 
 ```text
 ~/.pi/agent/pi-router.json
 ```
+
+If `PI_CODING_AGENT_DIR` is set, pi-router reads and writes `models.json`, `auth.json`, and `pi-router.json` under that directory instead.
 
 Advanced users can edit the file directly. A companion file is also generated:
 

@@ -64,6 +64,8 @@ Or create configuration file manually at `~/.pi/agent/pi-router.json`:
 
 See `examples/router.config.json` for all available options.
 
+This release targets pi `0.83+` and Node.js `22.19+`. pi-router follows pi's `PI_CODING_AGENT_DIR` setting when it is set, so custom agent directories work without duplicating configuration files.
+
 ---
 
 ## Verify Installation
@@ -72,7 +74,7 @@ See `examples/router.config.json` for all available options.
 # List installed packages
 pi list
 
-# Should show: pi-router@0.3.0-alpha.1
+# Should show: pi-router@0.5.0
 ```
 
 Start pi, then verify the command is available:
@@ -259,6 +261,6 @@ Configuration file location: `%USERPROFILE%\.pi\agent\pi-router.json`
 
 ---
 
-**Version**: v0.3.0-alpha.1  
+**Version**: v0.5.0
 **Author**: Jiang Jilin  
 **License**: MIT

@@ -1,6 +1,6 @@
 {
   "name": "pi-router",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Intelligent routing layer for pi coding agent with multi-level failover, circuit breaker, and comprehensive observability",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -53,17 +53,18 @@
   },
   "homepage": "https://github.com/jiangge/pi-router#readme",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.79.0",
-    "@earendil-works/pi-ai": ">=0.79.1",
-    "@earendil-works/pi-tui": ">=0.79.2"
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
+    "@earendil-works/pi-ai": ">=0.83.0",
+    "@earendil-works/pi-tui": ">=0.83.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.79.1",
-    "@earendil-works/pi-tui": "^0.79.2",
-    "@types/node": "^20.0.0",
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0",
+    "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^4.1.8",
     "typescript": "^5.0.0",
     "vitest": "^4.1.8"

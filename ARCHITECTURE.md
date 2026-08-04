@@ -42,7 +42,7 @@ Model Fallback (different models)
 
 ### 3. Configuration
 
-Located at `~/.pi/agent/pi-router.json`:
+Located at `~/.pi/agent/pi-router.json` by default, or under the directory selected by pi's `PI_CODING_AGENT_DIR` setting:
 
 ```json
 {
@@ -493,8 +493,8 @@ Preview differences between config and `models.json`
 
 - Pi documentation: `/home/jiang/.volta/tools/image/packages/@earendil-works/pi-coding-agent/lib/node_modules/@earendil-works/pi-coding-agent/README.md`
 - Extension API: `docs/extensions.md`
-- Models registry: `~/.pi/agent/models.json`
-- Router config: `~/.pi/agent/pi-router.json`
+- Models registry: `~/.pi/agent/models.json` by default (`PI_CODING_AGENT_DIR/models.json` when overridden)
+- Router config: `~/.pi/agent/pi-router.json` by default (`PI_CODING_AGENT_DIR/pi-router.json` when overridden)
 
 ---
 

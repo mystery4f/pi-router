@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { createAssistantMessageEventStream, registerApiProvider } from '@earendil-works/pi-ai';
+import { createAssistantMessageEventStream, registerApiProvider } from '@earendil-works/pi-ai/compat';
 import { visibleWidth } from '@earendil-works/pi-tui';
 import {
   __testGetInternalState,
   __testResetInternalState,
   __testRegisterRoutingAdapter,
+  __testSetCurrentModelRegistry,
   canAttemptChannel,
   createFailoverStream,
   createMirrorModels,
@@ -592,6 +593,55 @@ describe('request and event helpers', () => {
       maxRetryDelayMs: 789,
     });
     expect(configured?.timeoutMs).toBeUndefined();
+  });
+
+  it('uses the effective pi provider stream implementation when available', async () => {
+    const calls: string[] = [];
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: 'upstream-key' }),
+      getProvider: (provider: string) => provider === 'provider-a'
+        ? {
+            streamSimple: (model: any, _context: any, options: any) => {
+              calls.push(`${model.provider}/${model.id}:${options.apiKey}`);
+              const stream = createAssistantMessageEventStream();
+              const message = {
+                role: 'assistant',
+                content: [{ type: 'text', text: 'provider stream ok' }],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+                stopReason: 'stop',
+                timestamp: Date.now(),
+              };
+              queueMicrotask(() => {
+                stream.push({ type: 'text_delta', contentIndex: 0, delta: 'provider stream ok', partial: message } as any);
+                stream.push({ type: 'done', reason: 'stop', message } as any);
+                stream.end();
+              });
+              return stream;
+            },
+          }
+        : undefined,
+    });
+
+    const stream = createFailoverStream(
+      'm1',
+      ['provider-a'],
+      { messages: [] } as any,
+      undefined,
+      {} as any,
+      { id: 'm1', channels: ['provider-a'] } as any,
+      new Map([
+        ['m1@provider-a', { id: 'm1', name: 'Model One', provider: 'provider-a', api: 'provider-stream-test-api' }],
+      ]) as any,
+    );
+
+    const events: any[] = [];
+    for await (const event of stream) events.push(event);
+
+    expect(calls).toEqual(['provider-a/m1:upstream-key']);
+    expect(events.at(-1)?.message).toMatchObject({ provider: 'provider-a', model: 'm1' });
   });
 
   it('routes duplicate same-provider route variants independently', async () => {

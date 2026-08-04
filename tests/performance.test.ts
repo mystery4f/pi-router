@@ -19,6 +19,7 @@ import {
   __testSaveConfig,
   __testSetPiConfigDir,
   __testStartHealthProbes,
+  modelsFromRegistry,
 } from '../index.js';
 
 describe('Performance Optimizations', () => {
@@ -73,6 +74,36 @@ describe('Performance Optimizations', () => {
 
     const hash3 = __testCalculateFileHash(testFile);
     expect(hash3).not.toBe(hash1);
+  });
+
+  it('follows pi custom agent directories when no test override is set', () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    const customDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-router-agent-'));
+
+    try {
+      __testSetPiConfigDir(null);
+      process.env.PI_CODING_AGENT_DIR = customDir;
+      fs.writeFileSync(
+        path.join(customDir, 'models.json'),
+        JSON.stringify({
+          providers: {
+            'custom-agent-provider': {
+              models: [{ id: 'custom-agent-model', api: 'pi-router-test-api' }],
+            },
+          },
+        }),
+        'utf-8',
+      );
+
+      expect(__testLoadModelsJson().map(model => `${model.id}@${model.provider}`)).toEqual([
+        'custom-agent-model@custom-agent-provider',
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      __testSetPiConfigDir(testDir);
+      fs.rmSync(customDir, { recursive: true, force: true });
+    }
   });
 
   it('reloads models.json immediately when its mtime changes', () => {
@@ -130,6 +161,29 @@ describe('Performance Optimizations', () => {
     const providers = __testLoadModelsJson().map(model => model.provider);
 
     expect(providers).toEqual(['Provider-A']);
+  });
+
+  it('filters explicitly disabled providers from pi runtime models', () => {
+    fs.writeFileSync(
+      path.join(testDir, 'models.json'),
+      JSON.stringify({ providers: { 'disabled-provider': { models: [] } } }),
+      'utf-8',
+    );
+
+    const models = modelsFromRegistry({
+      getAvailable: () => [
+        {
+          id: 'builtin-model',
+          name: 'Builtin Model',
+          provider: 'disabled-provider',
+          api: 'openai-completions',
+          contextWindow: 128000,
+          maxTokens: 4096,
+        },
+      ],
+    });
+
+    expect(models).toEqual([]);
   });
 
   it('rebuilds cached model map when models.json changes', () => {
