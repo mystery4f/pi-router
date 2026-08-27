@@ -3535,6 +3535,56 @@ function findFirstConfiguredModel(
   return undefined;
 }
 
+/**
+ * Union thinking capabilities across a set of upstream models.
+ *
+ * pi only offers xhigh/max in the selector when the current model's
+ * thinkingLevelMap explicitly defines those keys, so a router mirror that
+ * inherits a single channel's map would hide levels supported by the rest of
+ * the failover chain (e.g. first channel has no "max" while a later channel
+ * like glm-5.3-flash@zhipu does).
+ */
+function mergeThinkingLevelMaps(models: PiModel[]): Record<string, string | null> | undefined {
+  const merged: Record<string, string | null> = {};
+  let found = false;
+  for (const model of models) {
+    const map = (model as { thinkingLevelMap?: Record<string, string | null> })?.thinkingLevelMap;
+    if (!map) continue;
+    for (const [level, value] of Object.entries(map)) {
+      if (value === null) {
+        // Explicit "unsupported" only fills an empty slot; another channel may still support it.
+        if (!(level in merged)) merged[level] = null;
+      } else if (merged[level] === undefined || merged[level] === null) {
+        // A concrete mapping from any channel wins over missing/null entries.
+        merged[level] = value;
+        found = true;
+      }
+    }
+  }
+  return found ? merged : undefined;
+}
+
+/**
+ * Resolve every reachable route across all configured models once, in user
+ * priority order, for whole-chain capability merging.
+ */
+function collectChainRouteModels(
+  configuredModels: RouterModelConfig[],
+  modelMap: Map<string, PiModel>
+): PiModel[] {
+  const models: PiModel[] = [];
+  const seen = new Set<string>();
+  for (const configModel of configuredModels) {
+    for (const routeEntry of getModelRouteEntries(configModel)) {
+      const route = resolveConfiguredRouteByEntry(configModel, routeEntry, modelMap);
+      if (!route || seen.has(route.routeKey)) continue;
+      seen.add(route.routeKey);
+      models.push(route.model);
+    }
+  }
+  return models;
+}
+
 function createMirrorModels(
   configuredModels: RouterModelConfig[],
   modelMap: Map<string, PiModel>
@@ -3548,6 +3598,12 @@ function createMirrorModels(
   const firstPrimaryModel = firstConfigured?.model;
   
   if (firstPrimaryModel) {
+    // The auto meta-model must advertise the union of every chained route's
+    // thinking capabilities; inheriting only the first channel would make
+    // xhigh/max selectable depending solely on which provider is first.
+    const autoThinkingLevelMap =
+      mergeThinkingLevelMaps(collectChainRouteModels(configuredModels, modelMap)) ??
+      firstPrimaryModel.thinkingLevelMap;
     mirrorModels.push({
       id: "auto",
       name: "Auto Router",
@@ -3560,7 +3616,7 @@ function createMirrorModels(
       maxTokens: firstPrimaryModel.maxTokens,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compat: firstPrimaryModel.compat,
-      thinkingLevelMap: firstPrimaryModel.thinkingLevelMap,
+      thinkingLevelMap: autoThinkingLevelMap,
     });
     debugLog(`[pi-router] Registered router/auto (auto mode) with ${configuredModels.length} models in chain`);
   }
@@ -3574,7 +3630,16 @@ function createMirrorModels(
       console.warn(`[pi-router] No available model found for configured router/${configModel.id}`);
       continue;
     }
-    
+
+    // Canonical mirrors also expose the union of their own channels' levels:
+    // an unsupported level downstream still clamps safely at the provider.
+    const ownRouteModels = getModelRouteEntries(configModel)
+      .map((entry) => resolveConfiguredRouteByEntry(configModel, entry, modelMap))
+      .filter((route): route is NonNullable<typeof route> => !!route)
+      .map((route) => route.model);
+    const modelThinkingLevelMap =
+      mergeThinkingLevelMaps(ownRouteModels) ?? primaryModel.thinkingLevelMap;
+
     // Create mirror model with router provider
     mirrorModels.push({
       id: configModel.id,
@@ -3588,7 +3653,7 @@ function createMirrorModels(
       maxTokens: primaryModel.maxTokens,
       cost: primaryModel.cost,
       compat: primaryModel.compat,
-      thinkingLevelMap: primaryModel.thinkingLevelMap,
+      thinkingLevelMap: modelThinkingLevelMap,
     });
     
     debugLog(`[pi-router] Configured router/${configModel.id} with ${configModel.channels.length} channels`);

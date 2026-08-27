@@ -363,6 +363,32 @@ describe('provider registration helpers', () => {
     });
   });
 
+  it('unions thinkingLevelMap across the whole chain for auto', () => {
+    const mirrors = createMirrorModels(
+      [
+        { id: 'm1', channels: ['primary', 'secondary'] },
+        { id: 'm2', channels: ['tertiary'] },
+      ] as any,
+      new Map([
+        ['m1@primary', { id: 'm1', name: 'Primary', provider: 'p1', api: 'api-a', reasoning: true, input: ['text'], contextWindow: 100, maxTokens: 10, thinkingLevelMap: { low: 'low', high: 'high', max: null } }],
+        ['m1@secondary', { id: 'm1', name: 'Secondary', provider: 'p2', api: 'api-b', reasoning: true, input: ['text'], contextWindow: 100, maxTokens: 10, thinkingLevelMap: { off: null, high: 'high', max: 'max' } }],
+        ['m2@tertiary', { id: 'm2', name: 'Tertiary', provider: 'p3', api: 'api-c', reasoning: true, input: ['text'], contextWindow: 100, maxTokens: 10, thinkingLevelMap: { xhigh: 'xhigh' } }],
+      ]) as any,
+    );
+
+    const auto = mirrors.find((model: any) => model.id === 'auto');
+    // "max" supported by a later channel must surface even though the first
+    // channel explicitly marks it unsupported; same for another chain entry's xhigh.
+    expect(auto?.thinkingLevelMap).toMatchObject({ low: 'low', high: 'high', max: 'max', xhigh: 'xhigh' });
+
+    // Canonical mirror unions its own channels only.
+    const m1 = mirrors.find((model: any) => model.id === 'm1');
+    expect(m1?.thinkingLevelMap).toMatchObject({ high: 'high', max: 'max' });
+
+    const m2 = mirrors.find((model: any) => model.id === 'm2');
+    expect(m2?.thinkingLevelMap).toMatchObject({ xhigh: 'xhigh' });
+  });
+
   it('creates router mirror models with custom api dispatch', () => {
     const mirrors = createMirrorModels(
       [
