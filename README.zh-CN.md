@@ -157,6 +157,9 @@ pi-router 会：
 /router sticky           # 显示当前粘性路由记录
 /router sticky clear     # 清除所有粘性记录（从头开始路由）
 /router sticky clear <m> # 清除指定模型的粘性记录
+/router reset            # 重置路由指针到链条 index 0（粘性 + 活动通道 + 冷却 + 熔断 + 失败历史）
+/router reset auto       # 同上，作用于 auto 链
+/router reset <m>        # 同上，作用于单个模型（重载后依然生效）
 ```
 
 ### 管理

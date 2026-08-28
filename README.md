@@ -157,6 +157,9 @@ Shortcuts:
 /router sticky           # Show current sticky routing records
 /router sticky clear     # Clear all sticky records (re-route from beginning)
 /router sticky clear <m> # Clear sticky record for a specific model
+/router reset            # Reset routing pointer to chain index 0 (sticky + active channel + cooldowns + circuits + failures)
+/router reset auto       # Same, scoped to the auto chain
+/router reset <m>        # Same, scoped to one model (persists across /reload)
 ```
 
 ### Management
