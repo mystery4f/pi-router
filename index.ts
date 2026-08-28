@@ -2566,7 +2566,7 @@ export default function (pi: ExtensionAPI) {
   
   // Register /router command
   pi.registerCommand("router", {
-    description: "pi-router operations (config, status, list, explain, decisions, probes, pricing, sync, diff, debug-footer)",
+    description: "pi-router operations (config, status, list, explain, decisions, probes, pricing, sync, diff, sticky, reset, debug-footer)",
     getArgumentCompletions: (prefix: string) => {
       // Handle trailing space: user typed "config " then hit tab
       const hasTrailingSpace = prefix.endsWith(' ');
@@ -2585,6 +2585,7 @@ export default function (pi: ExtensionAPI) {
           { value: "sync", label: "sync", description: "Check models.json changes" },
           { value: "diff", label: "diff", description: "Preview config differences" },
           { value: "sticky", label: "sticky", description: "View/clear sticky routing records" },
+          { value: "reset", label: "reset", description: "Reset routing pointer to chain index 0" },
           { value: "debug-footer", label: "debug-footer (df)", description: "Debug footer display status" },
         ];
         
@@ -2607,6 +2608,20 @@ export default function (pi: ExtensionAPI) {
         
         const secondPart = (parts[1] || '').toLowerCase();
         const filtered = configSubcommands.filter(cmd => cmd.value.startsWith(secondPart));
+        
+        return filtered.length > 0 ? filtered : null;
+      }
+      
+      // Second level: reset targets ("reset " / "reset a")
+      if (firstCmd === 'reset') {
+        const secondPart = (parts[1] || '').toLowerCase();
+        const currentConfig = getCurrentRouterConfig();
+        const items = [
+          { value: "all", label: "all", description: "Reset every model plus the auto chain" },
+          { value: "auto", label: "auto", description: "Reset the auto chain" },
+          ...(currentConfig.models || []).map(m => ({ value: m.id, label: m.id, description: `Reset router/${m.id}` })),
+        ];
+        const filtered = items.filter(cmd => cmd.value.toLowerCase().startsWith(secondPart));
         
         return filtered.length > 0 ? filtered : null;
       }
@@ -4748,6 +4763,12 @@ async function applyUpstreamRequestAuth(
     // fallback, so log and continue instead of failing the attempt.
     debugLog(`[pi-router] Registry auth unavailable for ${model.provider} (${auth.error || "unknown"}); falling back to provider SDK auth`);
     return nextOptions;
+  }
+  if (!auth.apiKey) {
+    // ok:true but no key — ${provider.key} style env refs resolved to
+    // nothing. The SDK will fail with "No API key for provider: X"; this
+    // line marks WHERE the key was lost.
+    debugLog(`[pi-router] Registry auth resolved WITHOUT a key for ${model.provider}; SDK auth will likely fail`);
   }
 
   const headers = auth.headers || nextOptions?.headers

@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createAssistantMessageEventStream, registerApiProvider } from '@earendil-works/pi-ai/compat';
 import { visibleWidth } from '@earendil-works/pi-tui';
@@ -6,6 +9,7 @@ import {
   __testResetInternalState,
   __testRegisterRoutingAdapter,
   __testSetCurrentModelRegistry,
+  __testSetPiConfigDir,
   canAttemptChannel,
   createFailoverStream,
   createMirrorModels,
@@ -1383,6 +1387,22 @@ describe('auth fallback (transient registry failures after reload)', () => {
 });
 
 describe('resetRoutingPointer', () => {
+  // resetRoutingPointer persists sticky removal via saveConfig — isolate the
+  // pi config dir so tests can NEVER overwrite the real user config.
+  // Re-applied in beforeEach: any file-level hook that clears the override
+  // (e.g. __testResetInternalState) runs before describe-level beforeEach.
+  let testConfigDir: string;
+
+  beforeEach(() => {
+    testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-router-cfg-'));
+    __testSetPiConfigDir(testConfigDir);
+  });
+
+  afterEach(() => {
+    __testSetPiConfigDir(null);
+    fs.rmSync(testConfigDir, { recursive: true, force: true });
+  });
+
   it('resets one model dimension: sticky, active channel, cooldowns, failures; leaves others intact', () => {
     const cfg = { sticky: true, models: [{ id: 'rm1', channels: ['c1', 'c2'] }, { id: 'rm9', channels: ['c9'] }] } as any;
     recordFailure('rm1', 'c1', 'boom', cfg, { id: 'rm1', channels: ['c1'] } as any);
