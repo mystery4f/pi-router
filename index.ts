@@ -25,8 +25,8 @@ import {
   type RouterRouteConfig,
   type RouterRouteEntry,
 } from "./router-routes.js";
+import { resolveLogDir, routerDebugLog, setRouterDebugState } from "./logger.js";
 
-const PI_ROUTER_DEBUG = process.env.PI_ROUTER_DEBUG === "1";
 const ROUTER_API = "pi-router" as Api;
 const ROUTER_DUMMY_API_KEY = "router";
 const DEFAULT_ROUTER_TIMEOUT_MS = Number(process.env.PI_ROUTER_TIMEOUT_MS || 120000);
@@ -35,9 +35,8 @@ const PI_ROUTING_REGISTRY = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS = Symbol.for("pi.cache.hints.v1");
 
 function debugLog(...args: unknown[]): void {
-  if (PI_ROUTER_DEBUG) {
-    console.log(...args);
-  }
+  // Console when PI_ROUTER_DEBUG=1; file under logDir when config.debug=true.
+  routerDebugLog(...args);
 }
 
 type PiModel = {
@@ -146,6 +145,8 @@ type RouterConfig = {
   stickyRecords?: Record<string, StickyRecord>;  // Persistent sticky state per model
   intent?: "suggest" | "auto" | "off";
   logDir?: string | null;
+  /** Append routing/failure diagnostics to logDir when true. */
+  debug?: boolean;
   autoSync?: boolean;  // Auto-detect local models.json/auth.json changes and prompt user; does not run health probes
   lastSyncHash?: string;  // Hash of models.json at last sync
   contextTransfer?: "none" | "summary" | "full";  // Context transfer strategy on model switch
@@ -1343,6 +1344,7 @@ function getFileMtimeMs(filePath: string): number | null {
 function setCurrentRouterConfig(config: RouterConfig): RouterConfig {
   currentRouterConfig = config;
   autoSyncConfig = config;
+  setRouterDebugState(config);
   routerState.customFooterEnabled = config.footer?.rightAlignRoute !== false;
   routerState.footerStatusLineEnabled = config.footer?.statusLine !== false;
   return config;
@@ -1470,7 +1472,10 @@ function addConfigComments(config: RouterConfig): Record<string, unknown> {
     summaryModel: config.summaryModel,
     summaryPrompt: config.summaryPrompt,
     summaryMaxTokens: config.summaryMaxTokens ?? 2000,
-    logDir: config.logDir,
+    _comment_debug: "调试模式: true=把路由尝试/失败详情(含原始错误)追加写入 logDir 下的 router-<日期>.log；也可用环境变量 PI_ROUTER_DEBUG=1 输出到控制台。修改后运行 /reload 生效",
+    debug: config.debug ?? false,
+    _comment_logDir: "调试日志目录，默认 ~/pi-data/pi-router/logs；仅在 debug: true 时写入",
+    logDir: config.logDir ?? null,
   };
 }
 
@@ -2794,6 +2799,13 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
       lines.push("  (all circuits closed)");
     }
     
+    // Debug logging status (where the raw diagnostics live)
+    lines.push("Debug Logging:");
+    lines.push(`  debug: ${config.debug ? "enabled" : "disabled"} (set "debug": true in ${getRouterConfigPath()}, then /reload)`);
+    lines.push(`  logDir: ${resolveLogDir(config.logDir)}`);
+    if (config.debug) {
+      lines.push("  log file: router-<date>.log under logDir (raw per-attempt errors + latencies)");
+    }
     ctx.ui.notify(lines.join("\n"), "info");
   } else if (subcommand === "decisions") {
     // Show recent routing decisions
@@ -3909,7 +3921,7 @@ async function relayAutoAttempt(
 
   const failedRelayResult = relayResult as Extract<RelayProviderStreamResult, { ok: false }>;
   const { error, aborted, committed } = failedRelayResult;
-  debugLog(`[pi-router] Auto mode failed on ${displayKey}:`, error);
+  debugLog(`[pi-router] Auto mode failed on ${displayKey} after ${Date.now() - streamStartTime}ms:`, error);
 
   updateRouteSnapshot(routerModelId, modelConfig.id, targetModel, "failed");
   if (aborted) {
@@ -4942,6 +4954,10 @@ function recordFailure(
     error,
     timestamp: Date.now(),
   });
+
+  // Raw upstream error (never the prettified user-facing string) so debug
+  // logs show the real cause of a failover.
+  debugLog(`[pi-router] Failure recorded ${key}: ${error}`);
 
   // Determine cooldown based on error type
   let cooldownMs: number;
