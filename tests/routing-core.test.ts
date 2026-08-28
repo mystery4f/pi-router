@@ -18,6 +18,8 @@ import {
   buildModelMap,
   estimateRequestCost,
   applyRouterRequestOptions,
+  applyUpstreamRequestAuth,
+  formatUserFacingFailure,
   formatFooterStatus,
   formatRightAlignedStatusLine,
   generateSimpleTextSummary,
@@ -30,6 +32,7 @@ import {
   recordCircuitOutcome,
   recordFailure,
   recordLatency,
+  resetRoutingPointer,
   resolveSummaryModel,
   sanitizeContextForSwitch,
   sortChannelsByCost,
@@ -1340,5 +1343,98 @@ describe('request and event helpers', () => {
 
     expect(events.some(e => e.partial?.provider === 'fb1')).toBe(false);
     expect(events.some(e => e.type === 'text_delta' && e.delta === 'ok' && e.partial?.provider === 'fb2')).toBe(true);
+  });
+});
+
+describe('auth fallback (transient registry failures after reload)', () => {
+  it('formats "No API key" errors as auth-unavailable, not a generic upstream error', () => {
+    expect(formatUserFacingFailure('No API key for provider: zhipu')).toContain('认证');
+  });
+
+  it('applies a short (<=5s) cooldown for auth-resolution failures', () => {
+    recordFailure(
+      'authm',
+      'Provider-A',
+      'No API key for provider: zhipu',
+      { failover: { cooldownMs: 60000 } } as any,
+      { id: 'authm', channels: ['Provider-A'] } as any,
+    );
+    const state = __testGetInternalState();
+    const remaining = (state.cooldowns.get('authm@Provider-A') ?? 0) - Date.now();
+    expect(remaining).toBeGreaterThan(0);
+    expect(remaining).toBeLessThanOrEqual(5000);
+  });
+
+  it('does not throw when the session registry fails to resolve auth; lets the SDK resolve credentials', async () => {
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'No API key for provider: zhipu' }),
+    });
+    try {
+      const options = await applyUpstreamRequestAuth(
+        { id: 'm1', name: 'm1', provider: 'zhipu', api: 'openai-completions' } as any,
+        { apiKey: 'router' } as any,
+      );
+      expect(options).toBeDefined();
+      expect((options as any).apiKey).toBeUndefined();
+    } finally {
+      __testSetCurrentModelRegistry(undefined);
+    }
+  });
+});
+
+describe('resetRoutingPointer', () => {
+  it('resets one model dimension: sticky, active channel, cooldowns, failures; leaves others intact', () => {
+    const cfg = { sticky: true, models: [{ id: 'rm1', channels: ['c1', 'c2'] }, { id: 'rm9', channels: ['c9'] }] } as any;
+    recordFailure('rm1', 'c1', 'boom', cfg, { id: 'rm1', channels: ['c1'] } as any);
+    recordFailure('rm9', 'c9', 'boom', cfg, { id: 'rm9', channels: ['c9'] } as any);
+    __testGetInternalState().activeChannels.set('rm1', 'c2');
+    __testGetInternalState().activeChannels.set('rm9', 'c9');
+
+    const result = resetRoutingPointer(cfg, 'rm1');
+
+    expect(result.scope).toBe('rm1');
+    expect(__testGetInternalState().cooldowns.has('rm1@c1')).toBe(false);
+    expect(__testGetInternalState().cooldowns.has('rm9@c9')).toBe(true);
+    expect(__testGetInternalState().activeChannels.has('rm1')).toBe(false);
+    expect(__testGetInternalState().activeChannels.has('rm9')).toBe(true);
+    expect(__testGetInternalState().failures.has('rm1')).toBe(false);
+    expect(__testGetInternalState().failures.has('rm9')).toBe(true);
+  });
+
+  it('reset sends the chain back to index 0 (no sticky-first ordering)', () => {
+    const modelConfig = { id: 'rm2', channels: ['c1', 'c2'] } as any;
+    const cfg = { sticky: true, models: [modelConfig] } as any;
+    __testGetInternalState().activeChannels.set('rm2', 'c2');
+    expect(determineChannelOrder('rm2', modelConfig, cfg)[0]).toBe('c2');
+
+    resetRoutingPointer(cfg, 'rm2');
+
+    expect(determineChannelOrder('rm2', modelConfig, cfg)[0]).toBe('c1');
+  });
+
+  it('auto scope clears the whole auto chain state', () => {
+    const cfg = { sticky: true, models: [{ id: 'a1', channels: ['x'] }, { id: 'a2', channels: ['y'] }] } as any;
+    recordFailure('a1', 'x', 'No API key for provider: x', cfg, { id: 'a1', channels: ['x'] } as any);
+    recordFailure('a2', 'y', 'No API key for provider: y', cfg, { id: 'a2', channels: ['y'] } as any);
+    expect(__testGetInternalState().cooldowns.size).toBeGreaterThan(0);
+
+    const result = resetRoutingPointer(cfg, 'auto');
+
+    expect(result.scope).toBe('auto');
+    expect(__testGetInternalState().cooldowns.size).toBe(0);
+  });
+
+  it('all scope also clears the auto sticky record', () => {
+    const cfg = {
+      sticky: true,
+      models: [{ id: 'a1', channels: ['x'] }],
+      stickyRecords: { auto: { modelId: 'a1', channel: 'x', successCount: 1, lastSuccess: Date.now(), lastUpdate: Date.now() } },
+    } as any;
+
+    const result = resetRoutingPointer(cfg);
+
+    expect(result.scope).toBe('all');
+    expect(result.stickyCleared).toEqual(['auto']);
+    expect(cfg.stickyRecords?.['auto']).toBeUndefined();
   });
 });
