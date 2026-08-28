@@ -3076,6 +3076,26 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
         ctx.ui.notify(lines.join("\n"), "info");
       }
     }
+  } else if (subcommand === "reset") {
+    // Reset the routing pointer (sticky + active channel + cooldowns +
+    // circuits + failure history) so the next request starts at chain
+    // index 0. Sticky state is persisted, so this survives /reload.
+    const target = parts[1];
+    const result = resetRoutingPointer(config, target);
+    const lines: string[] = ["Router Pointer Reset:", ""];
+    lines.push(`  Scope: ${result.scope}`);
+    lines.push(`  Sticky records cleared: ${result.stickyCleared.length > 0 ? result.stickyCleared.join(", ") : "(none)"}`);
+    lines.push(`  Active channels cleared: ${result.activeChannelsCleared}`);
+    lines.push(`  Cooldowns removed: ${result.cooldownsCleared}`);
+    lines.push(`  Health status reset: ${result.healthReset}`);
+    lines.push(`  Circuit breakers reset: ${result.circuitsReset}`);
+    lines.push(`  Failure history cleared: ${result.failuresCleared} entries`);
+    if (target && target !== "all" && target !== "auto" && !(config.models || []).some(m => m.id === target)) {
+      lines.push(`  note: "${target}" is not a configured model id. Configured: ${(config.models || []).map(m => m.id).join(", ") || "(none)"}`);
+    }
+    lines.push("");
+    lines.push("Next request will start at chain index 0.");
+    ctx.ui.notify(lines.join("\n"), "info");
   } else if (subcommand === "debug-footer" || subcommand === "df") {
     // Debug footer display status
     const status = routerState.lastStatusUpdate;
@@ -3829,6 +3849,94 @@ function clearStickyRecord(routerModelId: string, config: RouterConfig): void {
   }
 }
 
+/**
+ * Reset the routing pointer for a dimension back to chain index 0.
+ *
+ * Scopes:
+ * - undefined / "all": every configured model plus the auto meta-model
+ * - "auto": the auto chain (its sticky record plus every configured model)
+ * - "<modelId>": one router model
+ *
+ * Clears, scoped to the target: persistent sticky record, in-memory active
+ * channel, cooldowns, health status, circuit breakers and failure history,
+ * so the next request walks the chain from index 0. Sticky removal is
+ * persisted to disk, so the reset survives /reload (in-memory state resets
+ * naturally on reload anyway).
+ */
+function resetRoutingPointer(
+  config: RouterConfig,
+  target?: string
+): {
+  scope: string;
+  stickyCleared: string[];
+  activeChannelsCleared: number;
+  cooldownsCleared: number;
+  healthReset: number;
+  circuitsReset: number;
+  failuresCleared: number;
+} {
+  const scope = target && target !== "all" ? target : "all";
+  const models = config.models || [];
+  const targetModelIds =
+    scope === "all" || scope === "auto"
+      ? [...models.map(m => m.id), "auto"]
+      : [scope];
+  const stickyIds = scope === "all"
+    ? Object.keys(config.stickyRecords || {})
+    : scope === "auto"
+      ? ["auto"]
+      : [scope];
+
+  const stickyCleared: string[] = [];
+  for (const id of stickyIds) {
+    if (config.stickyRecords?.[id]) {
+      delete config.stickyRecords[id];
+      stickyCleared.push(id);
+    }
+  }
+  if (stickyCleared.length > 0) {
+    saveConfig(config);
+  }
+
+  let activeChannelsCleared = 0;
+  let failuresCleared = 0;
+  for (const mid of targetModelIds) {
+    if (routerState.activeChannels.delete(mid)) activeChannelsCleared++;
+    const failures = routerState.lastFailures.get(mid);
+    if (failures && failures.length > 0) {
+      failuresCleared += failures.length;
+      routerState.lastFailures.delete(mid);
+    }
+  }
+
+  const prefixMatch = (key: string) => targetModelIds.some(mid => key.startsWith(`${mid}@`));
+  let cooldownsCleared = 0;
+  for (const key of Array.from(routerState.cooldowns.keys())) {
+    if (prefixMatch(key)) {
+      routerState.cooldowns.delete(key);
+      cooldownsCleared++;
+    }
+  }
+  let healthReset = 0;
+  for (const key of Array.from(healthChecker.status.keys())) {
+    if (prefixMatch(key)) {
+      healthChecker.status.delete(key);
+      healthReset++;
+    }
+  }
+  let circuitsReset = 0;
+  for (const key of Array.from(circuitBreaker.circuits.keys())) {
+    if (prefixMatch(key)) {
+      circuitBreaker.circuits.delete(key);
+      circuitsReset++;
+    }
+  }
+
+  debugLog(`[pi-router] Pointer reset (scope=${scope}): sticky=${stickyCleared.join(",") || "none"}, cooldowns=${cooldownsCleared}, health=${healthReset}, circuits=${circuitsReset}, failures=${failuresCleared}`);
+
+  return { scope, stickyCleared, activeChannelsCleared, cooldownsCleared, healthReset, circuitsReset, failuresCleared };
+}
+
 let stickyPersistTimer: NodeJS.Timeout | null = null;
 
 function scheduleStickyPersist(config: RouterConfig): void {
@@ -4038,6 +4146,7 @@ function routeAutoChannelFirst(
         attemptedRoutes.length > 0 ? `Tried routes: ${attemptedRoutes.join(" → ")}` : "Tried routes: none",
         failures.length > 0 ? "Recent failures:\n" + failures.map((f, i) => `  ${i + 1}. ${f.channel}: ${formatUserFacingFailure(f.error)}`).join("\n") : "Recent failures: none recorded",
         "Run '/router explain' for detailed diagnostics.",
+        "Run '/router reset' to clear the pointer/cooldowns and retry from chain index 0.",
       ].join("\n");
       debugLog(errorMsg);
       eventStream.push(createRouterErrorEvent("auto", "router", ROUTER_API, errorMsg));
@@ -4174,6 +4283,7 @@ function routeAutoCustom(
         attemptedRoutes.length > 0 ? `Tried routes: ${attemptedRoutes.join(" → ")}` : "Tried routes: none",
         failures.length > 0 ? "Recent failures:\n" + failures.map((f, i) => `  ${i + 1}. ${f.channel}: ${formatUserFacingFailure(f.error)}`).join("\n") : "Recent failures: none recorded",
         "Run '/router explain' for detailed diagnostics.",
+        "Run '/router reset' to clear the pointer/cooldowns and retry from chain index 0.",
       ].join("\n");
       debugLog(errorMsg);
       eventStream.push(createRouterErrorEvent("auto", "router", ROUTER_API, errorMsg));
@@ -4563,6 +4673,9 @@ function formatUserFacingFailure(error: string): string {
   if (code === "401" || lower.includes("invalid token") || lower.includes("invalid api key") || text.includes("无效的令牌")) {
     return "认证失败（401/token 无效）";
   }
+  if (lower.includes("no api key")) {
+    return "认证暂不可用（注册表未解析到 key，已回退 SDK 认证）";
+  }
   if (code === "403" || lower.includes("forbidden") || lower.includes("blocked")) {
     return lower.includes("blocked") ? "请求被平台拦截（403）" : "请求被拒绝（403）";
   }
@@ -4629,7 +4742,12 @@ async function applyUpstreamRequestAuth(
 
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) {
-    throw new Error(auth.error || `No API key found for "${model.provider}"`);
+    // The session registry can transiently fail to resolve auth for every
+    // provider at once right after a reload (seen as "No API key for
+    // provider: X" on all channels). pi-ai's own auth chain is a proven
+    // fallback, so log and continue instead of failing the attempt.
+    debugLog(`[pi-router] Registry auth unavailable for ${model.provider} (${auth.error || "unknown"}); falling back to provider SDK auth`);
+    return nextOptions;
   }
 
   const headers = auth.headers || nextOptions?.headers
@@ -4973,7 +5091,18 @@ function recordFailure(
     lowerError.includes("timed out") ||
     lowerError.includes("connect");
 
-  if (isFastFailError) {
+  const isAuthResolutionError =
+    lowerError.includes("no api key") ||
+    lowerError.includes("unauthorized") ||
+    lowerError.includes("invalid api key") ||
+    lowerError.includes("invalid token");
+
+  if (isAuthResolutionError) {
+    // Transient auth-resolution failures (e.g. a freshly reloaded session
+    // registry) recover on their own; never lock the channel for a minute.
+    cooldownMs = 5000;
+    debugLog(`[pi-router] Auth resolution error detected, applying short cooldown: ${cooldownMs}ms`);
+  } else if (isFastFailError) {
     // Short cooldown for connection errors (5 seconds)
     cooldownMs = 5000;
     debugLog(`[pi-router] Fast-fail error detected, applying short cooldown: ${cooldownMs}ms`);
@@ -6048,6 +6177,7 @@ export {
   generateSimpleTextSummary,
   sanitizeContextForSwitch,
   recordFailure,
+  resetRoutingPointer,
   resolveSummaryModel,
   recordLatency,
   getAverageLatency,
@@ -6059,7 +6189,9 @@ export {
   updateFooterStatus,
   formatFooterStatus,
   formatRightAlignedStatusLine,
+  formatUserFacingFailure,
   applyRouterRequestOptions,
+  applyUpstreamRequestAuth,
   getStreamEventFailure,
   isAbortError,
   createMirrorModels,
