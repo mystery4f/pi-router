@@ -5,7 +5,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // ============================================================================
 // Types
@@ -61,7 +61,7 @@ type ProviderMeta = Record<string, { baseUrl?: string }>;
  * Load auth.json
  */
 function loadAuthJson(): Record<string, any> {
-  const authPath = path.join(os.homedir(), ".pi/agent/auth.json");
+  const authPath = path.join(getAgentDir(), "auth.json");
   if (!fs.existsSync(authPath)) return {};
   
   try {

@@ -1,3 +1,6 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FlatOrderEditor } from '../config-wizard-flat.js';
 import { buildEditableModelsFromConfig, hasExistingRouterModelConfig, runConfigOrderWizard, runConfigWizard } from '../config-wizard-flow.js';
@@ -31,6 +34,25 @@ describe('config wizard channel classification', () => {
     const result = scanAndClassifyChannels([], { 'openai-codex': { type: 'oauth' } });
 
     expect(result.get('openai-codex')).toEqual({ category: 'oauth', reason: 'OAuth official auth' });
+  });
+
+  it('reads auth.json from pi\'s configured agent directory', () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-router-wizard-agent-'));
+    try {
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      fs.writeFileSync(path.join(agentDir, 'auth.json'), JSON.stringify({ 'custom-oauth': { type: 'oauth' } }), 'utf8');
+
+      const result = scanAndClassifyChannels([
+        { id: 'm1', provider: 'custom-oauth', baseUrl: 'https://provider.example/v1' },
+      ]);
+
+      expect(result.get('custom-oauth')).toEqual({ category: 'oauth', reason: 'OAuth official auth' });
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      fs.rmSync(agentDir, { recursive: true, force: true });
+    }
   });
 });
 

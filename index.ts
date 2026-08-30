@@ -1472,7 +1472,7 @@ function addConfigComments(config: RouterConfig): Record<string, unknown> {
     summaryModel: config.summaryModel,
     summaryPrompt: config.summaryPrompt,
     summaryMaxTokens: config.summaryMaxTokens ?? 2000,
-    _comment_debug: "调试模式: true=把路由尝试/失败详情(含原始错误)追加写入 logDir 下的 router-<日期>.log；也可用环境变量 PI_ROUTER_DEBUG=1 输出到控制台。修改后运行 /reload 生效",
+    _comment_debug: "调试模式: true=把路由尝试/失败详情(上游错误会先脱敏)追加写入 logDir 下的 router-<日期>.log；也可用环境变量 PI_ROUTER_DEBUG=1 输出到控制台。修改后运行 /reload 生效",
     debug: config.debug ?? false,
     _comment_logDir: "调试日志目录，默认 ~/pi-data/pi-router/logs；仅在 debug: true 时写入",
     logDir: config.logDir ?? null,
@@ -2453,6 +2453,10 @@ export default function (pi: ExtensionAPI) {
       clearTimeout(healthProbeStartupTimer);
       healthProbeStartupTimer = undefined;
     }
+    if (stickyPersistTimer) {
+      clearTimeout(stickyPersistTimer);
+      stickyPersistTimer = null;
+    }
     stopHealthProbes();
   };
   const scheduleSessionResources = (currentConfig: RouterConfig) => {
@@ -2762,7 +2766,7 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
       totalFailures += recent.length;
       recent.forEach(f => {
         const ago = Math.floor((now - f.timestamp) / 1000);
-        lines.push(`  ${modelId}@${f.channel} (${ago}s ago): ${f.error.substring(0, 60)}`);
+        lines.push(`  ${modelId}@${f.channel} (${ago}s ago): ${formatUserFacingFailure(f.error)}`);
       });
     }
     if (totalFailures === 0) {
@@ -2819,7 +2823,7 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
     lines.push(`  debug: ${config.debug ? "enabled" : "disabled"} (set "debug": true in ${getRouterConfigPath()}, then /reload)`);
     lines.push(`  logDir: ${resolveLogDir(config.logDir)}`);
     if (config.debug) {
-      lines.push("  log file: router-<date>.log under logDir (raw per-attempt errors + latencies)");
+      lines.push("  log file: router-<date>.log under logDir (sanitized per-attempt errors + latencies)");
     }
     ctx.ui.notify(lines.join("\n"), "info");
   } else if (subcommand === "decisions") {
@@ -2866,7 +2870,7 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
         const ago = Math.floor((now - p.timestamp) / 1000);
         const status = p.success ? "success" : "failed";
         const latencyStr = p.latencyMs ? ` (${p.latencyMs}ms)` : "";
-        const errorStr = p.error ? ` - ${p.error}` : "";
+        const errorStr = p.error ? ` - ${formatUserFacingFailure(p.error)}` : "";
         lines.push(`  ${p.channel}: ${status}${latencyStr} (${ago}s ago)${errorStr}`);
       });
     }
@@ -3125,7 +3129,7 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
       lines.push(`  phase: ${status.phase}`);
       lines.push(`  attemptedChannels: ${status.attemptedChannels?.join(" -> ") || "(none)"}`);
       if (status.error) {
-        lines.push(`  error: ${status.error}`);
+        lines.push(`  error: ${formatUserFacingFailure(status.error)}`);
       }
       lines.push(`  timestamp: ${new Date(status.timestamp).toISOString()}`);
     } else {
@@ -3611,6 +3615,10 @@ function mergeThinkingLevelMaps(models: PiModel[]): Record<string, string | null
   return found ? merged : undefined;
 }
 
+function mergeReasoningCapabilities(models: PiModel[]): boolean {
+  return models.some(model => model.reasoning === true);
+}
+
 /**
  * Resolve every reachable route across all configured models once, in user
  * priority order, for whole-chain capability merging.
@@ -3648,8 +3656,9 @@ function createMirrorModels(
     // The auto meta-model must advertise the union of every chained route's
     // thinking capabilities; inheriting only the first channel would make
     // xhigh/max selectable depending solely on which provider is first.
+    const chainRouteModels = collectChainRouteModels(configuredModels, modelMap);
     const autoThinkingLevelMap =
-      mergeThinkingLevelMaps(collectChainRouteModels(configuredModels, modelMap)) ??
+      mergeThinkingLevelMaps(chainRouteModels) ??
       firstPrimaryModel.thinkingLevelMap;
     mirrorModels.push({
       id: "auto",
@@ -3657,7 +3666,7 @@ function createMirrorModels(
       // Must be the router provider API so pi-ai dispatches to pi-router's
       // custom streamSimple handler. The real upstream API comes from modelMap.
       api: ROUTER_API,
-      reasoning: firstPrimaryModel.reasoning,
+      reasoning: mergeReasoningCapabilities(chainRouteModels),
       input: firstPrimaryModel.input,
       contextWindow: firstPrimaryModel.contextWindow,
       maxTokens: firstPrimaryModel.maxTokens,
@@ -3687,6 +3696,11 @@ function createMirrorModels(
     const modelThinkingLevelMap =
       mergeThinkingLevelMaps(ownRouteModels) ?? primaryModel.thinkingLevelMap;
 
+    // Advertise reasoning when any reachable route supports it, matching the
+    // thinking-level union above. The selected provider still owns the final
+    // request translation when a fallback route is used.
+    const modelReasoning = mergeReasoningCapabilities(ownRouteModels);
+
     // Create mirror model with router provider
     mirrorModels.push({
       id: configModel.id,
@@ -3694,7 +3708,7 @@ function createMirrorModels(
       // Must be the router provider API so pi-ai dispatches to pi-router's
       // custom streamSimple handler. The real upstream API comes from modelMap.
       api: ROUTER_API,
-      reasoning: primaryModel.reasoning,
+      reasoning: modelReasoning,
       input: primaryModel.input,
       contextWindow: primaryModel.contextWindow,
       maxTokens: primaryModel.maxTokens,
@@ -4689,7 +4703,7 @@ function formatUserFacingFailure(error: string): string {
     return "认证失败（401/token 无效）";
   }
   if (lower.includes("no api key")) {
-    return "认证暂不可用（注册表未解析到 key，已回退 SDK 认证）";
+    return "认证不可用（未配置 API key）";
   }
   if (code === "403" || lower.includes("forbidden") || lower.includes("blocked")) {
     return lower.includes("blocked") ? "请求被平台拦截（403）" : "请求被拒绝（403）";
@@ -4734,59 +4748,98 @@ function toPiAiModel(model: PiModel): Model<Api> {
     thinkingLevelMap: model.thinkingLevelMap,
   };
 }
-  
-async function applyUpstreamRequestAuth(
+
+type UpstreamRequestAuth = {
+  model: Model<Api>;
+  options: SimpleStreamOptions | undefined;
+};
+
+function mergeResolvedAuth(
   model: Model<Api>,
   options: SimpleStreamOptions | undefined,
-): Promise<SimpleStreamOptions | undefined> {
+  auth: { apiKey?: string; headers?: Record<string, string | null>; env?: Record<string, string>; baseUrl?: string },
+): UpstreamRequestAuth {
+  const nextOptions: SimpleStreamOptions | undefined = options ? { ...options } : undefined;
+  const headers = auth.headers || nextOptions?.headers
+    ? { ...auth.headers, ...nextOptions?.headers }
+    : undefined;
+  const env = auth.env || nextOptions?.env
+    ? { ...auth.env, ...nextOptions?.env }
+    : undefined;
+
+  return {
+    model: auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model,
+    options: {
+      ...nextOptions,
+      ...(!nextOptions?.apiKey && auth.apiKey ? { apiKey: auth.apiKey } : {}),
+      ...(headers ? { headers } : {}),
+      ...(env ? { env } : {}),
+    },
+  };
+}
+
+async function resolveUpstreamRequestAuth(
+  model: Model<Api>,
+  options: SimpleStreamOptions | undefined,
+): Promise<UpstreamRequestAuth> {
   const nextOptions: SimpleStreamOptions | undefined = options ? { ...options } : undefined;
 
   if (nextOptions?.apiKey === ROUTER_DUMMY_API_KEY) {
     // pi authenticates the selected router/* model before entering our custom
     // streamSimple, so options.apiKey is the router provider's dummy key. If we
     // forward it, pi-ai will prefer that explicit key over the real upstream
-    // provider auth and every channel fails with 401 (often visible as
-    // "api key: ****uter"). Drop it before resolving real upstream auth.
+    // provider auth and every channel fails with 401. Drop it before resolving
+    // real upstream auth.
     delete nextOptions.apiKey;
   }
 
   const modelRegistry = routerState.currentModelRegistry;
-  if (!modelRegistry?.getApiKeyAndHeaders) {
-    return nextOptions;
+  if (!modelRegistry) {
+    return { model, options: nextOptions };
   }
 
-  const auth = await modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) {
-    // The session registry can transiently fail to resolve auth for every
-    // provider at once right after a reload (seen as "No API key for
-    // provider: X" on all channels). pi-ai's own auth chain is a proven
-    // fallback, so log and continue instead of failing the attempt.
-    debugLog(`[pi-router] Registry auth unavailable for ${model.provider} (${auth.error || "unknown"}); falling back to provider SDK auth`);
-    return nextOptions;
-  }
-  if (!auth.apiKey) {
-    // ok:true but no key — ${provider.key} style env refs resolved to
-    // nothing. The SDK will fail with "No API key for provider: X"; this
-    // line marks WHERE the key was lost.
-    debugLog(`[pi-router] Registry auth resolved WITHOUT a key for ${model.provider}; SDK auth will likely fail`);
+  let auth: { ok: boolean; apiKey?: string; headers?: Record<string, string | null>; env?: Record<string, string>; baseUrl?: string } | undefined;
+  if (modelRegistry.getApiKeyAndHeaders) {
+    try {
+      auth = await modelRegistry.getApiKeyAndHeaders(model);
+      if (auth.ok && (auth.apiKey || auth.headers || auth.env)) {
+        return mergeResolvedAuth(model, nextOptions, auth);
+      }
+    } catch (error) {
+      debugLog(`[pi-router] Registry auth lookup failed for ${model.provider}:`, error);
+    }
   }
 
-  const headers = auth.headers || nextOptions?.headers
-    ? { ...auth.headers, ...nextOptions?.headers }
-    : undefined;
-  // Pi 0.81+ can resolve provider-scoped environment values (for example
-  // Cloudflare account/gateway IDs) alongside the API key. Preserve them when
-  // a request is routed through the virtual provider.
-  const env = auth.env || nextOptions?.env
-    ? { ...auth.env, ...nextOptions?.env }
-    : undefined;
+  // getApiKeyAndHeaders is a compatibility facade. If its aggregate request
+  // resolution fails, retry through the public provider-auth path so OAuth
+  // refresh, stored credentials, provider-scoped env, and auth-owned baseUrl
+  // handling remain available instead of calling a raw provider with no auth.
+  if (modelRegistry.getProviderAuth) {
+    try {
+      const providerAuth = await modelRegistry.getProviderAuth(model.provider);
+      if (providerAuth) {
+        debugLog(`[pi-router] Provider auth fallback resolved for ${model.provider}`);
+        return mergeResolvedAuth(model, nextOptions, {
+          apiKey: providerAuth.auth?.apiKey,
+          headers: providerAuth.auth?.headers,
+          baseUrl: providerAuth.auth?.baseUrl,
+          env: providerAuth.env,
+        });
+      }
+    } catch (error) {
+      debugLog(`[pi-router] Provider auth fallback failed for ${model.provider}:`, error);
+    }
+  }
 
-  return {
-    ...nextOptions,
-    ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
-    ...(headers ? { headers } : {}),
-    ...(env ? { env } : {}),
-  };
+  debugLog(`[pi-router] Registry auth unavailable for ${model.provider}; falling back to provider SDK/environment auth`);
+  return { model, options: nextOptions };
+}
+
+async function applyUpstreamRequestAuth(
+  model: Model<Api>,
+  options: SimpleStreamOptions | undefined,
+): Promise<SimpleStreamOptions | undefined> {
+  return (await resolveUpstreamRequestAuth(model, options)).options;
 }
 
 function streamThroughProvider(
@@ -4829,10 +4882,16 @@ function forwardToProvider(
         return;
       }
 
-      const upstreamOptions = await applyUpstreamRequestAuth(realModel, routedOptions);
-      const providerOptions = upstreamOptions
-        ? { ...upstreamOptions, signal: linkedAbort.controller.signal }
+      const upstreamAuth = await resolveUpstreamRequestAuth(realModel, routedOptions);
+      const providerOptions = upstreamAuth.options
+        ? { ...upstreamAuth.options, signal: linkedAbort.controller.signal }
         : { signal: linkedAbort.controller.signal };
+      // A mirror advertises the union of route capabilities so Pi can expose
+      // one stable selector. Before calling a concrete route, remove thinking
+      // options when that selected upstream cannot process reasoning.
+      if (!upstreamAuth.model.reasoning) {
+        delete providerOptions.reasoning;
+      }
       // Do not pass pi/router timeoutMs into the provider SDK. Some SDKs apply it
       // as a hard request timer and still surface the generic "Request timed out."
       // message, which makes slow first-token models (DeepSeek reasoning variants)
@@ -4842,7 +4901,11 @@ function forwardToProvider(
       delete providerOptions.timeoutMs;
       debugLog(`[pi-router] Forwarding to ${model.provider} streamSimple`);
 
-      const upstreamStream = streamThroughProvider(realModel, hintedRequest.context, providerOptions);
+      const upstreamStream = streamThroughProvider(
+        upstreamAuth.model,
+        hintedRequest.context,
+        providerOptions,
+      );
       for await (const event of upstreamStream) {
         eventStream.push(event);
       }
@@ -5112,17 +5175,18 @@ function recordFailure(
     lowerError.includes("timed out") ||
     lowerError.includes("connect");
 
-  const isAuthResolutionError =
-    lowerError.includes("no api key") ||
-    lowerError.includes("unauthorized") ||
-    lowerError.includes("invalid api key") ||
-    lowerError.includes("invalid token");
+  const isTransientAuthResolutionError =
+    lowerError.includes("registry auth temporarily unavailable") ||
+    lowerError.includes("auth resolution temporarily unavailable") ||
+    lowerError.includes("credential store temporarily unavailable") ||
+    lowerError.includes("authentication temporarily unavailable");
 
-  if (isAuthResolutionError) {
-    // Transient auth-resolution failures (e.g. a freshly reloaded session
-    // registry) recover on their own; never lock the channel for a minute.
+  if (isTransientAuthResolutionError) {
+    // Only transient registry/credential-resolution failures receive the short
+    // cooldown. A real 401, invalid token, or missing API key must not be
+    // retried every five seconds with the same invalid/unconfigured credential.
     cooldownMs = 5000;
-    debugLog(`[pi-router] Auth resolution error detected, applying short cooldown: ${cooldownMs}ms`);
+    debugLog(`[pi-router] Transient auth-resolution error detected, applying short cooldown: ${cooldownMs}ms`);
   } else if (isFastFailError) {
     // Short cooldown for connection errors (5 seconds)
     cooldownMs = 5000;
@@ -6009,11 +6073,11 @@ async function probeChannel(
     healthProber.lastProbe.set(key, {
       channel: routeEntry.label,
       success: false,
-      error: String(err),
+      error: formatUserFacingFailure(getErrorMessage(err)),
       timestamp: Date.now(),
     });
     
-    debugLog(`[pi-router] Probe ${key} failed (${latencyMs}ms): ${err}`);
+    debugLog(`[pi-router] Probe ${key} failed (${latencyMs}ms):`, err);
   }
 }
 

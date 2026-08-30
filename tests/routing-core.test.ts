@@ -370,6 +370,21 @@ describe('provider registration helpers', () => {
     });
   });
 
+  it('unions reasoning across mixed reasoning and non-reasoning routes', () => {
+    const mirrors = createMirrorModels(
+      [{ id: 'mixed', channels: ['plain', 'thinking'] }] as any,
+      new Map([
+        ['mixed@plain', { id: 'mixed', name: 'Plain', provider: 'plain', api: 'api-a', reasoning: false, input: ['text'], contextWindow: 100, maxTokens: 10 }],
+        ['mixed@thinking', { id: 'mixed', name: 'Thinking', provider: 'thinking', api: 'api-b', reasoning: true, input: ['text'], contextWindow: 100, maxTokens: 10, thinkingLevelMap: { high: 'high' } }],
+      ]) as any,
+    );
+
+    expect(mirrors.find((model: any) => model.id === 'mixed')).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { high: 'high' },
+    });
+  });
+
   it('unions thinkingLevelMap across the whole chain for auto', () => {
     const mirrors = createMirrorModels(
       [
@@ -628,6 +643,53 @@ describe('request and event helpers', () => {
     expect(configured?.timeoutMs).toBeUndefined();
   });
 
+  it('does not send reasoning options to a non-reasoning selected route', async () => {
+    let receivedReasoning: unknown = 'not-called';
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: 'upstream-key' }),
+      getProvider: () => ({
+        streamSimple: (_model: any, _context: any, options: any) => {
+          receivedReasoning = options.reasoning;
+          const stream = createAssistantMessageEventStream();
+          const message = {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'plain route ok' }],
+            api: 'plain-route-test-api',
+            provider: 'plain',
+            model: 'm1',
+            usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            stopReason: 'stop',
+            timestamp: Date.now(),
+          };
+          queueMicrotask(() => {
+            stream.push({ type: 'text_delta', contentIndex: 0, delta: 'plain route ok', partial: message } as any);
+            stream.push({ type: 'done', reason: 'stop', message } as any);
+            stream.end();
+          });
+          return stream;
+        },
+      }),
+    });
+
+    const stream = createFailoverStream(
+      'm1',
+      ['plain'],
+      { messages: [] } as any,
+      { reasoning: 'high' } as any,
+      {} as any,
+      { id: 'm1', channels: ['plain'] } as any,
+      new Map([
+        ['m1@plain', { id: 'm1', name: 'Plain', provider: 'plain', api: 'plain-route-test-api', reasoning: false }],
+      ]) as any,
+    );
+
+    for await (const _event of stream) {
+      // Drain the stream so the provider invocation completes.
+    }
+
+    expect(receivedReasoning).toBeUndefined();
+  });
+
   it('uses the effective pi provider stream implementation when available', async () => {
     const calls: string[] = [];
     __testSetCurrentModelRegistry({
@@ -674,6 +736,72 @@ describe('request and event helpers', () => {
     for await (const event of stream) events.push(event);
 
     expect(calls).toEqual(['provider-a/m1:upstream-key']);
+    expect(events.at(-1)?.message).toMatchObject({ provider: 'provider-a', model: 'm1' });
+  });
+
+  it('uses provider auth fallback and preserves auth-owned model endpoint', async () => {
+    const calls: Array<{ provider: string; baseUrl: string; apiKey: string; env: Record<string, string> }> = [];
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'registry auth temporarily unavailable' }),
+      getProviderAuth: async () => ({
+        auth: {
+          apiKey: 'oauth-access-token',
+          baseUrl: 'https://oauth.example/v1',
+        },
+        env: { ACCOUNT_ID: 'account-1' },
+      }),
+      getProvider: (provider: string) => provider === 'provider-a'
+        ? {
+            streamSimple: (model: any, _context: any, options: any) => {
+              calls.push({
+                provider: model.provider,
+                baseUrl: model.baseUrl,
+                apiKey: options.apiKey,
+                env: options.env,
+              });
+              const stream = createAssistantMessageEventStream();
+              const message = {
+                role: 'assistant',
+                content: [{ type: 'text', text: 'provider auth fallback ok' }],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+                stopReason: 'stop',
+                timestamp: Date.now(),
+              };
+              queueMicrotask(() => {
+                stream.push({ type: 'text_delta', contentIndex: 0, delta: 'provider auth fallback ok', partial: message } as any);
+                stream.push({ type: 'done', reason: 'stop', message } as any);
+                stream.end();
+              });
+              return stream;
+            },
+          }
+        : undefined,
+    });
+
+    const stream = createFailoverStream(
+      'm1',
+      ['provider-a'],
+      { messages: [] } as any,
+      undefined,
+      {} as any,
+      { id: 'm1', channels: ['provider-a'] } as any,
+      new Map([
+        ['m1@provider-a', { id: 'm1', name: 'Model One', provider: 'provider-a', api: 'provider-auth-fallback-test-api', baseUrl: 'https://models.example/v1' }],
+      ]) as any,
+    );
+
+    const events: any[] = [];
+    for await (const event of stream) events.push(event);
+
+    expect(calls).toEqual([{
+      provider: 'provider-a',
+      baseUrl: 'https://oauth.example/v1',
+      apiKey: 'oauth-access-token',
+      env: { ACCOUNT_ID: 'account-1' },
+    }]);
     expect(events.at(-1)?.message).toMatchObject({ provider: 'provider-a', model: 'm1' });
   });
 
@@ -1355,7 +1483,7 @@ describe('auth fallback (transient registry failures after reload)', () => {
     expect(formatUserFacingFailure('No API key for provider: zhipu')).toContain('认证');
   });
 
-  it('applies a short (<=5s) cooldown for auth-resolution failures', () => {
+  it('uses the configured cooldown for a real missing API key failure', () => {
     recordFailure(
       'authm',
       'Provider-A',
@@ -1365,13 +1493,92 @@ describe('auth fallback (transient registry failures after reload)', () => {
     );
     const state = __testGetInternalState();
     const remaining = (state.cooldowns.get('authm@Provider-A') ?? 0) - Date.now();
+    expect(remaining).toBeGreaterThan(59000);
+    expect(remaining).toBeLessThanOrEqual(60000);
+  });
+
+  it('uses the configured cooldown for invalid tokens and unauthorized responses', () => {
+    for (const error of ['401 invalid token', '401 invalid api key', '401 unauthorized']) {
+      recordFailure(
+        'authm',
+        error,
+        error,
+        { failover: { cooldownMs: 60000 } } as any,
+        { id: 'authm', channels: [error] } as any,
+      );
+      const remaining = (__testGetInternalState().cooldowns.get(`authm@${error}`) ?? 0) - Date.now();
+      expect(remaining).toBeGreaterThan(59000);
+      expect(remaining).toBeLessThanOrEqual(60000);
+    }
+  });
+
+  it('uses a short cooldown only for explicit transient auth-resolution failures', () => {
+    recordFailure(
+      'authm',
+      'Provider-A',
+      'Registry auth temporarily unavailable',
+      { failover: { cooldownMs: 60000 } } as any,
+      { id: 'authm', channels: ['Provider-A'] } as any,
+    );
+    const remaining = (__testGetInternalState().cooldowns.get('authm@Provider-A') ?? 0) - Date.now();
     expect(remaining).toBeGreaterThan(0);
     expect(remaining).toBeLessThanOrEqual(5000);
   });
 
-  it('does not throw when the session registry fails to resolve auth; lets the SDK resolve credentials', async () => {
+  it('preserves an explicit real API key over registry-resolved credentials', async () => {
     __testSetCurrentModelRegistry({
-      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'No API key for provider: zhipu' }),
+      getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: 'registry-key' }),
+    });
+    try {
+      const options = await applyUpstreamRequestAuth(
+        { id: 'm1', name: 'm1', provider: 'zhipu', api: 'openai-completions' } as any,
+        { apiKey: 'explicit-key' } as any,
+      );
+      expect((options as any).apiKey).toBe('explicit-key');
+    } finally {
+      __testSetCurrentModelRegistry(undefined);
+    }
+  });
+
+  it('falls back to the host provider auth path after registry request resolution fails', async () => {
+    let providerAuthCalls = 0;
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'registry auth temporarily unavailable' }),
+      getProviderAuth: async () => {
+        providerAuthCalls++;
+        return {
+          auth: {
+            apiKey: 'stored-or-oauth-access-token',
+            headers: { Authorization: 'Bearer stored-or-oauth-access-token' },
+            baseUrl: 'https://oauth-provider.example/v1',
+          },
+          env: { ACCOUNT_ID: 'account-1' },
+        };
+      },
+    });
+    try {
+      const options = await applyUpstreamRequestAuth(
+        { id: 'm1', name: 'm1', provider: 'zhipu', api: 'openai-completions' } as any,
+        { apiKey: 'router', headers: { 'X-Request': '1' } } as any,
+      );
+      expect(providerAuthCalls).toBe(1);
+      expect(options).toMatchObject({
+        apiKey: 'stored-or-oauth-access-token',
+        headers: {
+          Authorization: 'Bearer stored-or-oauth-access-token',
+          'X-Request': '1',
+        },
+        env: { ACCOUNT_ID: 'account-1' },
+      });
+    } finally {
+      __testSetCurrentModelRegistry(undefined);
+    }
+  });
+
+  it('falls back without a dummy key when provider auth is unavailable', async () => {
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'registry auth temporarily unavailable' }),
+      getProviderAuth: async () => undefined,
     });
     try {
       const options = await applyUpstreamRequestAuth(

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DEFAULT_LOG_DIR, getRouterDebugState, resolveLogDir, routerDebugLog, setRouterDebugState } from '../logger.js';
+import { DEFAULT_LOG_DIR, getRouterDebugState, resolveLogDir, routerDebugLog, sanitizeLogText, setRouterDebugState } from '../logger.js';
 
 const tmpDirs: string[] = [];
 
@@ -35,6 +35,27 @@ describe('resolveLogDir', () => {
   });
 });
 
+describe('sanitizeLogText', () => {
+  it('redacts credentials in text, URLs, headers, and serialized objects', () => {
+    const text = [
+      'https://api.example.test?api_key=url-secret&x=1',
+      'Authorization: Bearer header-secret',
+      'Bearer standalone-secret',
+      'apiKey: object-secret',
+      '{"access_token":"token-secret","safe":"value"}',
+    ].join(' ');
+    const sanitized = sanitizeLogText(text);
+
+    expect(sanitized).not.toContain('url-secret');
+    expect(sanitized).not.toContain('header-secret');
+    expect(sanitized).not.toContain('standalone-secret');
+    expect(sanitized).not.toContain('object-secret');
+    expect(sanitized).not.toContain('token-secret');
+    expect(sanitized).toContain('[REDACTED]');
+    expect(sanitized).toContain('safe');
+  });
+});
+
 describe('routerDebugLog file mode', () => {
   it('appends debug lines to router-<date>.log when enabled', () => {
     const dir = makeTmpDir();
@@ -48,13 +69,27 @@ describe('routerDebugLog file mode', () => {
     expect(content).toMatch(/^\[\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('serializes Error objects with stack', () => {
+  it('serializes Error objects with stack without leaking credentials', () => {
     const dir = makeTmpDir();
     setRouterDebugState({ debug: true, logDir: dir });
-    routerDebugLog('[pi-router] boom:', new Error('kaboom'));
+    routerDebugLog('[pi-router] boom:', new Error('request failed: Authorization: Bearer secret-from-stack'));
     const today = new Date().toISOString().slice(0, 10);
     const content = fs.readFileSync(path.join(dir, `router-${today}.log`), 'utf-8');
-    expect(content).toContain('Error: kaboom');
+    expect(content).toContain('Error: request failed');
+    expect(content).not.toContain('secret-from-stack');
+    expect(content).toContain('[REDACTED]');
+  });
+
+  it('redacts sensitive object fields before writing them', () => {
+    const dir = makeTmpDir();
+    setRouterDebugState({ debug: true, logDir: dir });
+    routerDebugLog({ apiKey: 'object-secret', nested: { accessToken: 'token-secret' }, safe: 'value' });
+    const today = new Date().toISOString().slice(0, 10);
+    const content = fs.readFileSync(path.join(dir, `router-${today}.log`), 'utf-8');
+    expect(content).not.toContain('object-secret');
+    expect(content).not.toContain('token-secret');
+    expect(content).toContain('[REDACTED]');
+    expect(content).toContain('value');
   });
 
   it('writes nothing when debug is disabled', () => {

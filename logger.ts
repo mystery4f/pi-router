@@ -5,7 +5,7 @@
  * `debug: true` in pi-router.json additionally appends every log line to a
  * per-day file under `logDir` (default `~/pi-data/pi-router/logs`), so
  * unexpected failovers ("healthy" model switched, all-routes-exhausted) can
- * be diagnosed from the raw errors without attaching a console.
+ * be diagnosed from sanitized error details without attaching a console.
  *
  * @author dongcheng.xie
  */
@@ -47,14 +47,50 @@ export function getRouterDebugState(): RouterDebugState {
   return { ...debugState };
 }
 
+const SENSITIVE_KEY = /(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|auth(?:orization)?|bearer|password|passwd|secret|credential)/i;
+const SENSITIVE_QUERY_PARAMETER = /([?&](?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|token|auth(?:orization)?|password|secret|credential)=)[^&#\s]+/gi;
+const SENSITIVE_HEADER_VALUE = /((?:authorization|proxy-authorization|x-api-key|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token)\s*:\s*)(?:(?:bearer|basic)\s+)?[^\s,;]+/gi;
+const SENSITIVE_BEARER_VALUE = /\b(bearer|basic)\s+[^\s,;]+/gi;
+const SENSITIVE_ASSIGNMENT = /((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|password|passwd|secret|credential|authorization)\s*[:=]\s*)(["']?)[^\s,;}'\"]+\2/gi;
+const SENSITIVE_JSON_FIELD = /(["']?(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|password|passwd|secret|credential|authorization)["']?\s*:\s*)(["'])(.*?)\2/gi;
+
+export function sanitizeLogText(value: string): string {
+  return value
+    .replace(SENSITIVE_QUERY_PARAMETER, "$1[REDACTED]")
+    .replace(SENSITIVE_HEADER_VALUE, "$1[REDACTED]")
+    .replace(SENSITIVE_BEARER_VALUE, "$1 [REDACTED]")
+    .replace(SENSITIVE_JSON_FIELD, "$1$2[REDACTED]$2")
+    .replace(SENSITIVE_ASSIGNMENT, "$1$2[REDACTED]$2");
+}
+
+function sanitizeLogObject(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === "string") return sanitizeLogText(value);
+  if (value instanceof Error) {
+    return sanitizeLogText(value.stack || `${value.name}: ${value.message}`);
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeLogObject(item, seen));
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    result[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : sanitizeLogObject(child, seen);
+  }
+  return result;
+}
+
 function formatLogValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
+  if (typeof value === "string") return sanitizeLogText(value);
+  if (value instanceof Error) return sanitizeLogText(value.stack || `${value.name}: ${value.message}`);
   if (typeof value === "undefined") return "undefined";
   try {
-    return JSON.stringify(value);
+    return sanitizeLogText(JSON.stringify(sanitizeLogObject(value, new WeakSet())));
   } catch {
-    return String(value);
+    return sanitizeLogText(String(value));
   }
 }
 
@@ -80,11 +116,12 @@ function appendToLogFile(line: string): void {
 
 export function routerDebugLog(...args: unknown[]): void {
   if (args.length === 0) return;
+  const formattedArgs = args.map(formatLogValue);
   if (process.env.PI_ROUTER_DEBUG === "1") {
-    console.log(...args);
+    console.log(...formattedArgs);
   }
   if (debugState.debug) {
-    const message = args.map(formatLogValue).join(" ");
+    const message = formattedArgs.join(" ");
     appendToLogFile(`[${new Date().toISOString()}] ${message}`);
   }
 }
