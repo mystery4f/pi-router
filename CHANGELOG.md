@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-30
+
 ### Changed
 
+- Hardened host provider authentication fallback, cooldown classification, capability merging, and credential-safe diagnostics.
+- Preserved Pi host runtime ownership and verified npm packaging against Pi `0.84.4`.
 - **Pi host-provided runtime**: removed all Pi core packages from local development dependencies so npm no longer installs duplicate Pi runtime packages or creates a project-level `node_modules/.bin/pi`; Pi supplies `pi-coding-agent`, `pi-ai`, and `pi-tui` through its extension loader, and `getAgentDir()` therefore always comes from the running Pi. The three core packages remain optional peer dependencies for compatibility metadata only.
 - **Provider auth fallback**: retry host provider authentication after a transient registry lookup failure, preserving OAuth/API-key credentials, provider-scoped environment values, model endpoints, and explicit request keys.
 - **Capability-safe routing**: union `reasoning` across route chains and suppress reasoning options when a selected fallback provider does not support them.
