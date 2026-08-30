@@ -4802,7 +4802,7 @@ async function resolveUpstreamRequestAuth(
   if (modelRegistry.getApiKeyAndHeaders) {
     try {
       auth = await modelRegistry.getApiKeyAndHeaders(model);
-      if (auth.ok && (auth.apiKey || auth.headers || auth.env)) {
+      if (auth.ok && (auth.apiKey || auth.headers || auth.env || auth.baseUrl)) {
         return mergeResolvedAuth(model, nextOptions, auth);
       }
     } catch (error) {

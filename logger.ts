@@ -47,12 +47,12 @@ export function getRouterDebugState(): RouterDebugState {
   return { ...debugState };
 }
 
-const SENSITIVE_KEY = /(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|auth(?:orization)?|bearer|password|passwd|secret|credential)/i;
+const SENSITIVE_KEY = /(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|token|auth(?:orization)?|bearer|password|passwd|secret|credential)/i;
 const SENSITIVE_QUERY_PARAMETER = /([?&](?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|token|auth(?:orization)?|password|secret|credential)=)[^&#\s]+/gi;
 const SENSITIVE_HEADER_VALUE = /((?:authorization|proxy-authorization|x-api-key|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token)\s*:\s*)(?:(?:bearer|basic)\s+)?[^\s,;]+/gi;
 const SENSITIVE_BEARER_VALUE = /\b(bearer|basic)\s+[^\s,;]+/gi;
-const SENSITIVE_ASSIGNMENT = /((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|password|passwd|secret|credential|authorization)\s*[:=]\s*)(["']?)[^\s,;}'\"]+\2/gi;
-const SENSITIVE_JSON_FIELD = /(["']?(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|password|passwd|secret|credential|authorization)["']?\s*:\s*)(["'])(.*?)\2/gi;
+const SENSITIVE_ASSIGNMENT = /((?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|token|password|passwd|secret|credential|authorization)\s*[:=]\s*)(["']?)[^\s,;}'\"]+\2/gi;
+const SENSITIVE_JSON_FIELD = /(["']?(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|id[-_ ]?token|token|password|passwd|secret|credential|authorization)["']?\s*:\s*)(["'])(.*?)\2/gi;
 
 export function sanitizeLogText(value: string): string {
   return value
