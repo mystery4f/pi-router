@@ -5,6 +5,16 @@ All notable changes to pi-router will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Pi host-provided runtime**: removed `@earendil-works/pi-coding-agent` from local development dependencies so npm no longer creates a project-level `node_modules/.bin/pi`; Pi supplies the runtime API and `getAgentDir()` through its extension loader. Pi core packages are declared as optional peers, while `pi-ai` and `pi-tui` remain development-only tooling for standalone checks.
+
+### Tests
+
+- Revalidated type checking, the full test suite, and production builds against pi `0.84.4`.
+
 ## [0.5.0] - 2026-08-04
 
 ### Changed

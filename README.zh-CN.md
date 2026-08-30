@@ -84,7 +84,7 @@ pi install /path/to/pi-router
 
 如果设置了 `PI_CODING_AGENT_DIR`，pi-router 也会跟随该目录读取和写入 `models.json`、`auth.json` 与 `pi-router.json`。
 
-当前版本面向 pi `0.83+` 和 Node.js `22.19+`。高级用户可直接编辑配置文件。同时会生成参考说明文件：
+当前开发版本面向 pi `0.84.4+` 和 Node.js `22.19+`。高级用户可直接编辑配置文件。同时会生成参考说明文件：
 
 ```text
 ~/.pi/agent/pi-router.README.md

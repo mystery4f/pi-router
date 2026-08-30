@@ -46,7 +46,7 @@ pi install git:github.com/jiangge/pi-router
 pi install /path/to/pi-router
 ```
 
-See [INSTALL.md](INSTALL.md) for detailed installation options. The current release targets pi `0.83+` and Node.js `22.19+`.
+See [INSTALL.md](INSTALL.md) for detailed installation options. The current development version targets pi `0.84.4+` and Node.js `22.19+`.
 
 ### 2. Configure
 
