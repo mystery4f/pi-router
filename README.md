@@ -157,6 +157,9 @@ Shortcuts:
 /router sticky           # Show current sticky routing records
 /router sticky clear     # Clear all sticky records (re-route from beginning)
 /router sticky clear <m> # Clear sticky record for a specific model
+/router reset            # Reset routing pointer to chain index 0 (sticky + active channel + cooldowns + circuits + failures)
+/router reset auto       # Same, scoped to the auto chain
+/router reset <m>        # Same, scoped to one model (persists across /reload)
 ```
 
 ### Management
@@ -325,6 +328,7 @@ Background feature defaults:
 - `autoSync` defaults to `true`. It only checks local `models.json`/`auth.json` changes and prompts you to sync; it does not run health probes or call model providers.
 - `healthProbe.enabled` defaults to `false` and is the only switch for background health checks. If set to `true`, pi-router periodically sends the configured `probeMessage` to real upstream models (for example every `intervalMs` milliseconds). These are real API calls and may create extra usage/costs.
 - `healthProbe.probeMessage` must be longer than 10 characters. Some third-party channels reject very short messages (e.g. `"ping"`) as liveness probes. If your configured value is missing or too short, pi-router falls back to a safe default automatically.
+- `debug: true` appends routing decisions, per-attempt latencies and raw upstream errors to `router-<date>.log` inside `logDir` (default `~/pi-data/pi-router/logs`). Use it to diagnose unexpected failovers (a "healthy" model being switched away, all-routes-exhausted errors). Alternatively set the `PI_ROUTER_DEBUG=1` environment variable for console output. `/router explain` shows the effective debug status and log directory.
 
 Footer defaults:
 

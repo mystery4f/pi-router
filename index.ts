@@ -25,8 +25,8 @@ import {
   type RouterRouteConfig,
   type RouterRouteEntry,
 } from "./router-routes.js";
+import { resolveLogDir, routerDebugLog, setRouterDebugState } from "./logger.js";
 
-const PI_ROUTER_DEBUG = process.env.PI_ROUTER_DEBUG === "1";
 const ROUTER_API = "pi-router" as Api;
 const ROUTER_DUMMY_API_KEY = "router";
 const DEFAULT_ROUTER_TIMEOUT_MS = Number(process.env.PI_ROUTER_TIMEOUT_MS || 120000);
@@ -35,9 +35,8 @@ const PI_ROUTING_REGISTRY = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS = Symbol.for("pi.cache.hints.v1");
 
 function debugLog(...args: unknown[]): void {
-  if (PI_ROUTER_DEBUG) {
-    console.log(...args);
-  }
+  // Console when PI_ROUTER_DEBUG=1; file under logDir when config.debug=true.
+  routerDebugLog(...args);
 }
 
 type PiModel = {
@@ -146,6 +145,8 @@ type RouterConfig = {
   stickyRecords?: Record<string, StickyRecord>;  // Persistent sticky state per model
   intent?: "suggest" | "auto" | "off";
   logDir?: string | null;
+  /** Append routing/failure diagnostics to logDir when true. */
+  debug?: boolean;
   autoSync?: boolean;  // Auto-detect local models.json/auth.json changes and prompt user; does not run health probes
   lastSyncHash?: string;  // Hash of models.json at last sync
   contextTransfer?: "none" | "summary" | "full";  // Context transfer strategy on model switch
@@ -1343,6 +1344,7 @@ function getFileMtimeMs(filePath: string): number | null {
 function setCurrentRouterConfig(config: RouterConfig): RouterConfig {
   currentRouterConfig = config;
   autoSyncConfig = config;
+  setRouterDebugState(config);
   routerState.customFooterEnabled = config.footer?.rightAlignRoute !== false;
   routerState.footerStatusLineEnabled = config.footer?.statusLine !== false;
   return config;
@@ -1470,7 +1472,10 @@ function addConfigComments(config: RouterConfig): Record<string, unknown> {
     summaryModel: config.summaryModel,
     summaryPrompt: config.summaryPrompt,
     summaryMaxTokens: config.summaryMaxTokens ?? 2000,
-    logDir: config.logDir,
+    _comment_debug: "调试模式: true=把路由尝试/失败详情(含原始错误)追加写入 logDir 下的 router-<日期>.log；也可用环境变量 PI_ROUTER_DEBUG=1 输出到控制台。修改后运行 /reload 生效",
+    debug: config.debug ?? false,
+    _comment_logDir: "调试日志目录，默认 ~/pi-data/pi-router/logs；仅在 debug: true 时写入",
+    logDir: config.logDir ?? null,
   };
 }
 
@@ -2561,7 +2566,7 @@ export default function (pi: ExtensionAPI) {
   
   // Register /router command
   pi.registerCommand("router", {
-    description: "pi-router operations (config, status, list, explain, decisions, probes, pricing, sync, diff, debug-footer)",
+    description: "pi-router operations (config, status, list, explain, decisions, probes, pricing, sync, diff, sticky, reset, debug-footer)",
     getArgumentCompletions: (prefix: string) => {
       // Handle trailing space: user typed "config " then hit tab
       const hasTrailingSpace = prefix.endsWith(' ');
@@ -2580,6 +2585,7 @@ export default function (pi: ExtensionAPI) {
           { value: "sync", label: "sync", description: "Check models.json changes" },
           { value: "diff", label: "diff", description: "Preview config differences" },
           { value: "sticky", label: "sticky", description: "View/clear sticky routing records" },
+          { value: "reset", label: "reset", description: "Reset routing pointer to chain index 0" },
           { value: "debug-footer", label: "debug-footer (df)", description: "Debug footer display status" },
         ];
         
@@ -2602,6 +2608,20 @@ export default function (pi: ExtensionAPI) {
         
         const secondPart = (parts[1] || '').toLowerCase();
         const filtered = configSubcommands.filter(cmd => cmd.value.startsWith(secondPart));
+        
+        return filtered.length > 0 ? filtered : null;
+      }
+      
+      // Second level: reset targets ("reset " / "reset a")
+      if (firstCmd === 'reset') {
+        const secondPart = (parts[1] || '').toLowerCase();
+        const currentConfig = getCurrentRouterConfig();
+        const items = [
+          { value: "all", label: "all", description: "Reset every model plus the auto chain" },
+          { value: "auto", label: "auto", description: "Reset the auto chain" },
+          ...(currentConfig.models || []).map(m => ({ value: m.id, label: m.id, description: `Reset router/${m.id}` })),
+        ];
+        const filtered = items.filter(cmd => cmd.value.toLowerCase().startsWith(secondPart));
         
         return filtered.length > 0 ? filtered : null;
       }
@@ -2794,6 +2814,13 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
       lines.push("  (all circuits closed)");
     }
     
+    // Debug logging status (where the raw diagnostics live)
+    lines.push("Debug Logging:");
+    lines.push(`  debug: ${config.debug ? "enabled" : "disabled"} (set "debug": true in ${getRouterConfigPath()}, then /reload)`);
+    lines.push(`  logDir: ${resolveLogDir(config.logDir)}`);
+    if (config.debug) {
+      lines.push("  log file: router-<date>.log under logDir (raw per-attempt errors + latencies)");
+    }
     ctx.ui.notify(lines.join("\n"), "info");
   } else if (subcommand === "decisions") {
     // Show recent routing decisions
@@ -3064,6 +3091,26 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
         ctx.ui.notify(lines.join("\n"), "info");
       }
     }
+  } else if (subcommand === "reset") {
+    // Reset the routing pointer (sticky + active channel + cooldowns +
+    // circuits + failure history) so the next request starts at chain
+    // index 0. Sticky state is persisted, so this survives /reload.
+    const target = parts[1];
+    const result = resetRoutingPointer(config, target);
+    const lines: string[] = ["Router Pointer Reset:", ""];
+    lines.push(`  Scope: ${result.scope}`);
+    lines.push(`  Sticky records cleared: ${result.stickyCleared.length > 0 ? result.stickyCleared.join(", ") : "(none)"}`);
+    lines.push(`  Active channels cleared: ${result.activeChannelsCleared}`);
+    lines.push(`  Cooldowns removed: ${result.cooldownsCleared}`);
+    lines.push(`  Health status reset: ${result.healthReset}`);
+    lines.push(`  Circuit breakers reset: ${result.circuitsReset}`);
+    lines.push(`  Failure history cleared: ${result.failuresCleared} entries`);
+    if (target && target !== "all" && target !== "auto" && !(config.models || []).some(m => m.id === target)) {
+      lines.push(`  note: "${target}" is not a configured model id. Configured: ${(config.models || []).map(m => m.id).join(", ") || "(none)"}`);
+    }
+    lines.push("");
+    lines.push("Next request will start at chain index 0.");
+    ctx.ui.notify(lines.join("\n"), "info");
   } else if (subcommand === "debug-footer" || subcommand === "df") {
     // Debug footer display status
     const status = routerState.lastStatusUpdate;
@@ -3535,6 +3582,56 @@ function findFirstConfiguredModel(
   return undefined;
 }
 
+/**
+ * Union thinking capabilities across a set of upstream models.
+ *
+ * pi only offers xhigh/max in the selector when the current model's
+ * thinkingLevelMap explicitly defines those keys, so a router mirror that
+ * inherits a single channel's map would hide levels supported by the rest of
+ * the failover chain (e.g. first channel has no "max" while a later channel
+ * like glm-5.3-flash@zhipu does).
+ */
+function mergeThinkingLevelMaps(models: PiModel[]): Record<string, string | null> | undefined {
+  const merged: Record<string, string | null> = {};
+  let found = false;
+  for (const model of models) {
+    const map = (model as { thinkingLevelMap?: Record<string, string | null> })?.thinkingLevelMap;
+    if (!map) continue;
+    for (const [level, value] of Object.entries(map)) {
+      if (value === null) {
+        // Explicit "unsupported" only fills an empty slot; another channel may still support it.
+        if (!(level in merged)) merged[level] = null;
+      } else if (merged[level] === undefined || merged[level] === null) {
+        // A concrete mapping from any channel wins over missing/null entries.
+        merged[level] = value;
+        found = true;
+      }
+    }
+  }
+  return found ? merged : undefined;
+}
+
+/**
+ * Resolve every reachable route across all configured models once, in user
+ * priority order, for whole-chain capability merging.
+ */
+function collectChainRouteModels(
+  configuredModels: RouterModelConfig[],
+  modelMap: Map<string, PiModel>
+): PiModel[] {
+  const models: PiModel[] = [];
+  const seen = new Set<string>();
+  for (const configModel of configuredModels) {
+    for (const routeEntry of getModelRouteEntries(configModel)) {
+      const route = resolveConfiguredRouteByEntry(configModel, routeEntry, modelMap);
+      if (!route || seen.has(route.routeKey)) continue;
+      seen.add(route.routeKey);
+      models.push(route.model);
+    }
+  }
+  return models;
+}
+
 function createMirrorModels(
   configuredModels: RouterModelConfig[],
   modelMap: Map<string, PiModel>
@@ -3548,6 +3645,12 @@ function createMirrorModels(
   const firstPrimaryModel = firstConfigured?.model;
   
   if (firstPrimaryModel) {
+    // The auto meta-model must advertise the union of every chained route's
+    // thinking capabilities; inheriting only the first channel would make
+    // xhigh/max selectable depending solely on which provider is first.
+    const autoThinkingLevelMap =
+      mergeThinkingLevelMaps(collectChainRouteModels(configuredModels, modelMap)) ??
+      firstPrimaryModel.thinkingLevelMap;
     mirrorModels.push({
       id: "auto",
       name: "Auto Router",
@@ -3560,7 +3663,7 @@ function createMirrorModels(
       maxTokens: firstPrimaryModel.maxTokens,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compat: firstPrimaryModel.compat,
-      thinkingLevelMap: firstPrimaryModel.thinkingLevelMap,
+      thinkingLevelMap: autoThinkingLevelMap,
     });
     debugLog(`[pi-router] Registered router/auto (auto mode) with ${configuredModels.length} models in chain`);
   }
@@ -3574,7 +3677,16 @@ function createMirrorModels(
       console.warn(`[pi-router] No available model found for configured router/${configModel.id}`);
       continue;
     }
-    
+
+    // Canonical mirrors also expose the union of their own channels' levels:
+    // an unsupported level downstream still clamps safely at the provider.
+    const ownRouteModels = getModelRouteEntries(configModel)
+      .map((entry) => resolveConfiguredRouteByEntry(configModel, entry, modelMap))
+      .filter((route): route is NonNullable<typeof route> => !!route)
+      .map((route) => route.model);
+    const modelThinkingLevelMap =
+      mergeThinkingLevelMaps(ownRouteModels) ?? primaryModel.thinkingLevelMap;
+
     // Create mirror model with router provider
     mirrorModels.push({
       id: configModel.id,
@@ -3588,7 +3700,7 @@ function createMirrorModels(
       maxTokens: primaryModel.maxTokens,
       cost: primaryModel.cost,
       compat: primaryModel.compat,
-      thinkingLevelMap: primaryModel.thinkingLevelMap,
+      thinkingLevelMap: modelThinkingLevelMap,
     });
     
     debugLog(`[pi-router] Configured router/${configModel.id} with ${configModel.channels.length} channels`);
@@ -3752,6 +3864,94 @@ function clearStickyRecord(routerModelId: string, config: RouterConfig): void {
   }
 }
 
+/**
+ * Reset the routing pointer for a dimension back to chain index 0.
+ *
+ * Scopes:
+ * - undefined / "all": every configured model plus the auto meta-model
+ * - "auto": the auto chain (its sticky record plus every configured model)
+ * - "<modelId>": one router model
+ *
+ * Clears, scoped to the target: persistent sticky record, in-memory active
+ * channel, cooldowns, health status, circuit breakers and failure history,
+ * so the next request walks the chain from index 0. Sticky removal is
+ * persisted to disk, so the reset survives /reload (in-memory state resets
+ * naturally on reload anyway).
+ */
+function resetRoutingPointer(
+  config: RouterConfig,
+  target?: string
+): {
+  scope: string;
+  stickyCleared: string[];
+  activeChannelsCleared: number;
+  cooldownsCleared: number;
+  healthReset: number;
+  circuitsReset: number;
+  failuresCleared: number;
+} {
+  const scope = target && target !== "all" ? target : "all";
+  const models = config.models || [];
+  const targetModelIds =
+    scope === "all" || scope === "auto"
+      ? [...models.map(m => m.id), "auto"]
+      : [scope];
+  const stickyIds = scope === "all"
+    ? Object.keys(config.stickyRecords || {})
+    : scope === "auto"
+      ? ["auto"]
+      : [scope];
+
+  const stickyCleared: string[] = [];
+  for (const id of stickyIds) {
+    if (config.stickyRecords?.[id]) {
+      delete config.stickyRecords[id];
+      stickyCleared.push(id);
+    }
+  }
+  if (stickyCleared.length > 0) {
+    saveConfig(config);
+  }
+
+  let activeChannelsCleared = 0;
+  let failuresCleared = 0;
+  for (const mid of targetModelIds) {
+    if (routerState.activeChannels.delete(mid)) activeChannelsCleared++;
+    const failures = routerState.lastFailures.get(mid);
+    if (failures && failures.length > 0) {
+      failuresCleared += failures.length;
+      routerState.lastFailures.delete(mid);
+    }
+  }
+
+  const prefixMatch = (key: string) => targetModelIds.some(mid => key.startsWith(`${mid}@`));
+  let cooldownsCleared = 0;
+  for (const key of Array.from(routerState.cooldowns.keys())) {
+    if (prefixMatch(key)) {
+      routerState.cooldowns.delete(key);
+      cooldownsCleared++;
+    }
+  }
+  let healthReset = 0;
+  for (const key of Array.from(healthChecker.status.keys())) {
+    if (prefixMatch(key)) {
+      healthChecker.status.delete(key);
+      healthReset++;
+    }
+  }
+  let circuitsReset = 0;
+  for (const key of Array.from(circuitBreaker.circuits.keys())) {
+    if (prefixMatch(key)) {
+      circuitBreaker.circuits.delete(key);
+      circuitsReset++;
+    }
+  }
+
+  debugLog(`[pi-router] Pointer reset (scope=${scope}): sticky=${stickyCleared.join(",") || "none"}, cooldowns=${cooldownsCleared}, health=${healthReset}, circuits=${circuitsReset}, failures=${failuresCleared}`);
+
+  return { scope, stickyCleared, activeChannelsCleared, cooldownsCleared, healthReset, circuitsReset, failuresCleared };
+}
+
 let stickyPersistTimer: NodeJS.Timeout | null = null;
 
 function scheduleStickyPersist(config: RouterConfig): void {
@@ -3844,7 +4044,7 @@ async function relayAutoAttempt(
 
   const failedRelayResult = relayResult as Extract<RelayProviderStreamResult, { ok: false }>;
   const { error, aborted, committed } = failedRelayResult;
-  debugLog(`[pi-router] Auto mode failed on ${displayKey}:`, error);
+  debugLog(`[pi-router] Auto mode failed on ${displayKey} after ${Date.now() - streamStartTime}ms:`, error);
 
   updateRouteSnapshot(routerModelId, modelConfig.id, targetModel, "failed");
   if (aborted) {
@@ -3961,6 +4161,7 @@ function routeAutoChannelFirst(
         attemptedRoutes.length > 0 ? `Tried routes: ${attemptedRoutes.join(" → ")}` : "Tried routes: none",
         failures.length > 0 ? "Recent failures:\n" + failures.map((f, i) => `  ${i + 1}. ${f.channel}: ${formatUserFacingFailure(f.error)}`).join("\n") : "Recent failures: none recorded",
         "Run '/router explain' for detailed diagnostics.",
+        "Run '/router reset' to clear the pointer/cooldowns and retry from chain index 0.",
       ].join("\n");
       debugLog(errorMsg);
       eventStream.push(createRouterErrorEvent("auto", "router", ROUTER_API, errorMsg));
@@ -4097,6 +4298,7 @@ function routeAutoCustom(
         attemptedRoutes.length > 0 ? `Tried routes: ${attemptedRoutes.join(" → ")}` : "Tried routes: none",
         failures.length > 0 ? "Recent failures:\n" + failures.map((f, i) => `  ${i + 1}. ${f.channel}: ${formatUserFacingFailure(f.error)}`).join("\n") : "Recent failures: none recorded",
         "Run '/router explain' for detailed diagnostics.",
+        "Run '/router reset' to clear the pointer/cooldowns and retry from chain index 0.",
       ].join("\n");
       debugLog(errorMsg);
       eventStream.push(createRouterErrorEvent("auto", "router", ROUTER_API, errorMsg));
@@ -4486,6 +4688,9 @@ function formatUserFacingFailure(error: string): string {
   if (code === "401" || lower.includes("invalid token") || lower.includes("invalid api key") || text.includes("无效的令牌")) {
     return "认证失败（401/token 无效）";
   }
+  if (lower.includes("no api key")) {
+    return "认证暂不可用（注册表未解析到 key，已回退 SDK 认证）";
+  }
   if (code === "403" || lower.includes("forbidden") || lower.includes("blocked")) {
     return lower.includes("blocked") ? "请求被平台拦截（403）" : "请求被拒绝（403）";
   }
@@ -4552,7 +4757,18 @@ async function applyUpstreamRequestAuth(
 
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) {
-    throw new Error(auth.error || `No API key found for "${model.provider}"`);
+    // The session registry can transiently fail to resolve auth for every
+    // provider at once right after a reload (seen as "No API key for
+    // provider: X" on all channels). pi-ai's own auth chain is a proven
+    // fallback, so log and continue instead of failing the attempt.
+    debugLog(`[pi-router] Registry auth unavailable for ${model.provider} (${auth.error || "unknown"}); falling back to provider SDK auth`);
+    return nextOptions;
+  }
+  if (!auth.apiKey) {
+    // ok:true but no key — ${provider.key} style env refs resolved to
+    // nothing. The SDK will fail with "No API key for provider: X"; this
+    // line marks WHERE the key was lost.
+    debugLog(`[pi-router] Registry auth resolved WITHOUT a key for ${model.provider}; SDK auth will likely fail`);
   }
 
   const headers = auth.headers || nextOptions?.headers
@@ -4878,6 +5094,10 @@ function recordFailure(
     timestamp: Date.now(),
   });
 
+  // Raw upstream error (never the prettified user-facing string) so debug
+  // logs show the real cause of a failover.
+  debugLog(`[pi-router] Failure recorded ${key}: ${error}`);
+
   // Determine cooldown based on error type
   let cooldownMs: number;
 
@@ -4892,7 +5112,18 @@ function recordFailure(
     lowerError.includes("timed out") ||
     lowerError.includes("connect");
 
-  if (isFastFailError) {
+  const isAuthResolutionError =
+    lowerError.includes("no api key") ||
+    lowerError.includes("unauthorized") ||
+    lowerError.includes("invalid api key") ||
+    lowerError.includes("invalid token");
+
+  if (isAuthResolutionError) {
+    // Transient auth-resolution failures (e.g. a freshly reloaded session
+    // registry) recover on their own; never lock the channel for a minute.
+    cooldownMs = 5000;
+    debugLog(`[pi-router] Auth resolution error detected, applying short cooldown: ${cooldownMs}ms`);
+  } else if (isFastFailError) {
     // Short cooldown for connection errors (5 seconds)
     cooldownMs = 5000;
     debugLog(`[pi-router] Fast-fail error detected, applying short cooldown: ${cooldownMs}ms`);
@@ -5967,6 +6198,7 @@ export {
   generateSimpleTextSummary,
   sanitizeContextForSwitch,
   recordFailure,
+  resetRoutingPointer,
   resolveSummaryModel,
   recordLatency,
   getAverageLatency,
@@ -5978,7 +6210,9 @@ export {
   updateFooterStatus,
   formatFooterStatus,
   formatRightAlignedStatusLine,
+  formatUserFacingFailure,
   applyRouterRequestOptions,
+  applyUpstreamRequestAuth,
   getStreamEventFailure,
   isAbortError,
   createMirrorModels,

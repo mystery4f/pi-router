@@ -157,6 +157,9 @@ pi-router 会：
 /router sticky           # 显示当前粘性路由记录
 /router sticky clear     # 清除所有粘性记录（从头开始路由）
 /router sticky clear <m> # 清除指定模型的粘性记录
+/router reset            # 重置路由指针到链条 index 0（粘性 + 活动通道 + 冷却 + 熔断 + 失败历史）
+/router reset auto       # 同上，作用于 auto 链
+/router reset <m>        # 同上，作用于单个模型（重载后依然生效）
 ```
 
 ### 管理
@@ -324,6 +327,7 @@ custom:       按 customOrder 中显式配置的 model@channel 顺序尝试
 - `autoSync` 默认为 `true`。它只检查本地 `models.json`/`auth.json` 变化并提示同步；不会执行健康探测，也不会调用模型提供商。
 - `healthProbe.enabled` 默认为 `false`，并且是后台健康检测的唯一开关。如果设为 `true`，pi-router 会按 `intervalMs` 间隔把 `probeMessage` 发送给真实上游模型（例如每 10 分钟一次）。这些是真实 API 调用，可能产生额外用量/费用。
 - `healthProbe.probeMessage` 需大于 10 个字符。部分第三方渠道会拒绝过短消息（如 `"ping"`）作为测活探针。若配置值缺失或过短，pi-router 会自动回退到安全默认值。
+- `debug: true` 会把路由决策、每次尝试的延迟与原始上游错误追加写入 `logDir`（默认 `~/pi-data/pi-router/logs`）下的 `router-<日期>.log`。用于排查"模型明明正常却被切换"、"所有路由耗尽"等场景。也可设置环境变量 `PI_ROUTER_DEBUG=1` 输出到控制台。`/router explain` 会显示 debug 状态与日志目录。
 
 Footer 默认行为：
 
