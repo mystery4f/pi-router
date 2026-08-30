@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Pi host-provided runtime**: removed `@earendil-works/pi-coding-agent` from local development dependencies so npm no longer creates a project-level `node_modules/.bin/pi`; Pi supplies the runtime API and `getAgentDir()` through its extension loader. Pi core packages are declared as optional peers, while `pi-ai` and `pi-tui` remain development-only tooling for standalone checks.
+- **Pi host-provided runtime**: removed all Pi core packages from local development dependencies so npm no longer installs duplicate Pi runtime packages or creates a project-level `node_modules/.bin/pi`; Pi supplies `pi-coding-agent`, `pi-ai`, and `pi-tui` through its extension loader, and `getAgentDir()` therefore always comes from the running Pi. The three core packages remain optional peer dependencies for compatibility metadata only.
 
 ### Tests
 

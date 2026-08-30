@@ -46,7 +46,7 @@ pi install git:github.com/jiangge/pi-router
 pi install /path/to/pi-router
 ```
 
-See [INSTALL.md](INSTALL.md) for detailed installation options. The current development version targets pi `0.84.4+` and Node.js `22.19+`.
+See [INSTALL.md](INSTALL.md) for detailed installation options. The current development version targets pi `0.84.4+` and Node.js `22.19+`. Pi core packages are supplied by the running host; pi-router does not install duplicate `pi-coding-agent`, `pi-ai`, or `pi-tui` packages, and therefore does not create a project-local `node_modules/.bin/pi`.
 
 ### 2. Configure
 
