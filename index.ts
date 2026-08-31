@@ -3521,12 +3521,28 @@ type RouterState = {
   unregisterRoutingAdapter?: () => void;
 };
 
+// pi reloads the extension module with jiti moduleCache:false, so each reload
+// creates a new module instance with its own module-level routerState copy.
+// The provider streamSimple closure that actually routes stays registered from
+// the first instance, while the latest instance's session_start/turn_start
+// handlers write ctx.modelRegistry into the latest copy. Routing then reads an
+// empty registry and every channel fails with "No API key for provider".
+// Share only the model registry through globalThis so all instances see the
+// latest value; the rest of routerState stays per-instance to preserve the
+// routing adapter, footer, and reset lifecycle behavior.
+const GLOBAL_MODEL_REGISTRY_KEY = "__piRouterModelRegistry";
 const routerState: RouterState = {
   activeChannels: new Map(),
   cooldowns: new Map(),
   lastFailures: new Map(),
   activeRouteSnapshots: new Map(),
   routeListeners: new Set(),
+  get currentModelRegistry(): any {
+    return (globalThis as any)[GLOBAL_MODEL_REGISTRY_KEY];
+  },
+  set currentModelRegistry(registry: any) {
+    (globalThis as any)[GLOBAL_MODEL_REGISTRY_KEY] = registry;
+  },
 };
 
 // FIX #1, #10: Cache modelMap to avoid rebuilding on every request
