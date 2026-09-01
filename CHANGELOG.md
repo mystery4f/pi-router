@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reload-safe provider lifecycle**: unregister stale `router` providers and routing adapters during session shutdown, then replace the bootstrap provider with the current extension instance at session start. This keeps `streamSimple`, the authenticated model registry, and router state in the same module instance after `/reload` without process-global session state.
+- **Session reference cleanup**: release model registry, UI, session manager, footer, route snapshot, and listener references when a session shuts down.
+
+### Tests
+
+- Added reload lifecycle coverage for provider replacement/removal, routing adapter replacement, stale registry cleanup, and authentication through the replacement session registry.
+
 ## [0.5.1] - 2026-08-30
 
 ### Changed

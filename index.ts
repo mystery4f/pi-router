@@ -2497,6 +2497,12 @@ export default function (pi: ExtensionAPI) {
     let currentConfig = refreshConfigFromDisk(config);
     updateFooterContext(ctx);
 
+    // Provider registrations outlive an ExtensionRunner in pi's ModelRuntime.
+    // Remove any bootstrap or stale registration before binding this module
+    // instance, so its streamSimple closure and lifecycle handlers cannot split
+    // across different extension instances after /reload.
+    pi.unregisterProvider("router");
+
     // Pi 0.83 may add models through provider-owned dynamic catalogs or other
     // extensions. Read the authenticated runtime registry once the session
     // context is available, and use it for both auto-discovery and mirror
@@ -2537,6 +2543,22 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     clearSessionResources();
+    restoreDefaultFooter();
+    pi.unregisterProvider("router");
+    routerState.unregisterRoutingAdapter?.();
+    routerState.unregisterRoutingAdapter = undefined;
+    routerState.routeListeners.clear();
+    routerState.activeRouteSnapshots.clear();
+    routerState.currentUi = undefined;
+    routerState.currentTheme = undefined;
+    routerState.currentModel = undefined;
+    routerState.currentModelProvider = undefined;
+    routerState.currentThinkingLevel = undefined;
+    routerState.currentSessionManager = undefined;
+    routerState.currentSessionHash = undefined;
+    routerState.currentRouterModelId = undefined;
+    routerState.currentGetContextUsage = undefined;
+    routerState.currentModelRegistry = undefined;
   });
 
   pi.on("turn_start", async (_event, ctx) => {

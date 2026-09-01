@@ -1,10 +1,10 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createAssistantMessageEventStream, registerApiProvider } from '@earendil-works/pi-ai/compat';
 import { visibleWidth } from '@earendil-works/pi-tui';
-import {
+import routerExtension, {
   __testGetInternalState,
   __testResetInternalState,
   __testRegisterRoutingAdapter,
@@ -1590,6 +1590,158 @@ describe('auth fallback (transient registry failures after reload)', () => {
     } finally {
       __testSetCurrentModelRegistry(undefined);
     }
+  });
+});
+
+describe('extension reload lifecycle', () => {
+  let testConfigDir: string;
+
+  beforeEach(() => {
+    testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-router-lifecycle-'));
+    __testSetPiConfigDir(testConfigDir);
+    fs.writeFileSync(path.join(testConfigDir, 'pi-router.json'), JSON.stringify({
+      auto: false,
+      autoSync: false,
+      healthProbe: { enabled: false },
+      models: [{ id: 'm1', channels: ['provider-a'] }],
+    }));
+    fs.writeFileSync(path.join(testConfigDir, 'models.json'), JSON.stringify({
+      providers: {
+        'provider-a': {
+          api: 'openai-completions',
+          baseUrl: 'https://provider-a.test',
+          models: [{
+            id: 'm1',
+            name: 'm1',
+            reasoning: false,
+            input: ['text'],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 128000,
+            maxTokens: 4096,
+          }],
+        },
+      },
+    }));
+  });
+
+  afterEach(() => {
+    __testSetPiConfigDir(null);
+    fs.rmSync(testConfigDir, { recursive: true, force: true });
+  });
+
+  function createExtensionHarness() {
+    const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<void>>>();
+    const providers = new Map<string, any>();
+    const providerEvents: string[] = [];
+    const pi = {
+      on(event: string, handler: (event: any, ctx: any) => Promise<void>) {
+        const eventHandlers = handlers.get(event) || [];
+        eventHandlers.push(handler);
+        handlers.set(event, eventHandlers);
+      },
+      registerProvider(name: string, config: any) {
+        providerEvents.push(`register:${name}`);
+        providers.set(name, config);
+      },
+      unregisterProvider(name: string) {
+        providerEvents.push(`unregister:${name}`);
+        providers.delete(name);
+      },
+      registerCommand() {},
+      getThinkingLevel() { return 'off'; },
+    };
+    const emit = async (event: string, ctx: any = {}) => {
+      for (const handler of handlers.get(event) || []) {
+        await handler({ type: event, reason: event === 'session_shutdown' ? 'reload' : 'reload' }, ctx);
+      }
+    };
+    return { pi: pi as any, providers, providerEvents, emit };
+  }
+
+  function createSessionContext(apiKey: string) {
+    const upstreamModel = {
+      id: 'm1',
+      name: 'm1',
+      provider: 'provider-a',
+      api: 'openai-completions',
+      baseUrl: 'https://provider-a.test',
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 4096,
+    };
+    return {
+      modelRegistry: {
+        getAvailable: () => [upstreamModel],
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
+      },
+      model: { id: 'm1', provider: 'router' },
+      sessionManager: { getSessionId: () => `session-${apiKey}` },
+      getContextUsage: () => undefined,
+      ui: {
+        theme: {},
+        setStatus() {},
+        setFooter() {},
+        notify() {},
+      },
+    };
+  }
+
+  it('replaces the bootstrap provider with the session-bound provider and unregisters it on reload', async () => {
+    const harness = createExtensionHarness();
+    routerExtension(harness.pi);
+    const bootstrapProvider = harness.providers.get('router');
+    expect(bootstrapProvider).toBeDefined();
+
+    await harness.emit('session_start', createSessionContext('session-a-key'));
+
+    expect(harness.providerEvents.slice(-2)).toEqual(['unregister:router', 'register:router']);
+    expect(harness.providers.get('router')).toBeDefined();
+    expect(harness.providers.get('router')).not.toBe(bootstrapProvider);
+
+    await harness.emit('session_shutdown');
+
+    expect(harness.providers.has('router')).toBe(false);
+    expect(harness.providerEvents.at(-1)).toBe('unregister:router');
+  });
+
+  it('drops stale session references and routing adapters before the replacement instance starts', async () => {
+    const first = createExtensionHarness();
+    routerExtension(first.pi);
+    const routingRegistry = (globalThis as any)[Symbol.for('pi.routing.registry.v1')];
+    const firstAdapter = routingRegistry.getRouter('router');
+    expect(firstAdapter).toBeDefined();
+
+    await first.emit('session_start', createSessionContext('session-a-key'));
+    const authenticated = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(authenticated?.apiKey).toBe('session-a-key');
+
+    await first.emit('session_shutdown');
+    expect(routingRegistry.getRouter('router')).toBeUndefined();
+
+    const afterShutdown = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(afterShutdown?.apiKey).toBeUndefined();
+
+    const second = createExtensionHarness();
+    routerExtension(second.pi);
+    const secondAdapter = routingRegistry.getRouter('router');
+    expect(secondAdapter).toBeDefined();
+    expect(secondAdapter).not.toBe(firstAdapter);
+
+    await second.emit('session_start', createSessionContext('session-b-key'));
+    const replacementAuth = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(replacementAuth?.apiKey).toBe('session-b-key');
+    await second.emit('session_shutdown');
   });
 });
 
