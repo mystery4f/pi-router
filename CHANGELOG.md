@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Transient request authentication**: treat empty auth containers as unresolved, retain a short-lived last-known-good auth result only within the active model registry and unchanged model/auth files, invalidate it on session or file changes, and refuse unauthenticated dispatch after an explicit registry auth failure.
+- **Transient request authentication**: treat empty compatibility-facade auth containers as unresolved on current registries, retry model-aware authentication once before consulting Pi's provider-auth path, preserve valid ambient and explicit request authentication, and fail closed instead of dispatching without resolved credentials.
 
 ### Tests
 
-- Added regression coverage for config writes, transient registry failures, empty auth results, provider-dispatch prevention, registry replacement, and auth-file invalidation.
+- Added regression coverage for transient registry failures, empty compatibility results, ambient credentials, explicit request credentials, request-scoped credential resolution, registry replacement during async lookup, authless and legacy registry behavior, and provider-dispatch prevention.
 
 ## [0.5.2] - 2026-09-01
 

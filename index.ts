@@ -2308,7 +2308,7 @@ function refreshFooterContext(ctx: any, thinkingLevel?: string): void {
   routerState.currentSessionManager = ctx.sessionManager;
   routerState.currentSessionHash = getSessionHashFromManager(ctx.sessionManager);
   routerState.currentGetContextUsage = typeof ctx.getContextUsage === "function" ? () => ctx.getContextUsage() : undefined;
-  setCurrentModelRegistry(ctx.modelRegistry);
+  routerState.currentModelRegistry = ctx.modelRegistry;
 }
 
 function ensureRouterFooterInstalled(): void {
@@ -2558,8 +2558,7 @@ export default function (pi: ExtensionAPI) {
     routerState.currentSessionHash = undefined;
     routerState.currentRouterModelId = undefined;
     routerState.currentGetContextUsage = undefined;
-    setCurrentModelRegistry(undefined);
-    clearRequestAuthCache();
+    routerState.currentModelRegistry = undefined;
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -3563,58 +3562,12 @@ let cachedModelMapRegistryRef: any = null;
 let cachedModelMapModelsMtime: number | null = null;
 let cachedModelMapAuthMtime: number | null = null;
 
-const REQUEST_AUTH_CACHE_TTL = 30_000;
-
 type ResolvedUpstreamAuth = {
   apiKey?: string;
   headers?: Record<string, string | null>;
   env?: Record<string, string>;
   baseUrl?: string;
 };
-
-type CachedRequestAuth = {
-  auth: ResolvedUpstreamAuth;
-  timestamp: number;
-};
-
-// Request auth is deliberately session-local. It is only a short-lived
-// last-known-good value for a single registry and the current models/auth
-// files; it is never persisted or logged.
-const requestAuthCache = new Map<string, CachedRequestAuth>();
-let requestAuthCacheRegistryRef: any = undefined;
-let requestAuthCacheModelsMtime: number | null | undefined = undefined;
-let requestAuthCacheAuthMtime: number | null | undefined = undefined;
-
-function clearRequestAuthCache(): void {
-  requestAuthCache.clear();
-  requestAuthCacheRegistryRef = undefined;
-  requestAuthCacheModelsMtime = undefined;
-  requestAuthCacheAuthMtime = undefined;
-}
-
-function setCurrentModelRegistry(modelRegistry: any): void {
-  if (routerState.currentModelRegistry !== modelRegistry) {
-    clearRequestAuthCache();
-  }
-  routerState.currentModelRegistry = modelRegistry;
-}
-
-function syncRequestAuthCache(
-  modelRegistry: any,
-  modelsMtime: number | null,
-  authMtime: number | null,
-): void {
-  if (
-    requestAuthCacheRegistryRef !== modelRegistry ||
-    requestAuthCacheModelsMtime !== modelsMtime ||
-    requestAuthCacheAuthMtime !== authMtime
-  ) {
-    requestAuthCache.clear();
-    requestAuthCacheRegistryRef = modelRegistry;
-    requestAuthCacheModelsMtime = modelsMtime;
-    requestAuthCacheAuthMtime = authMtime;
-  }
-}
 
 function hasNonEmptyAuthRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length > 0;
@@ -3641,44 +3594,34 @@ function hasUsableResolvedUpstreamAuth(auth: ResolvedUpstreamAuth): boolean {
   return Object.keys(auth).length > 0;
 }
 
-function getRequestAuthCacheKey(model: Model<Api>): string {
-  const modelHeaders = model.headers
-    ? Object.entries(model.headers).sort(([left], [right]) => left.localeCompare(right))
-    : undefined;
-  return JSON.stringify([model.provider, model.id, model.api, model.baseUrl, modelHeaders]);
-}
-
-function getRecentRequestAuth(cacheKey: string): ResolvedUpstreamAuth | undefined {
-  const entry = requestAuthCache.get(cacheKey);
-  if (!entry) return undefined;
-  if (Date.now() - entry.timestamp > REQUEST_AUTH_CACHE_TTL) {
-    requestAuthCache.delete(cacheKey);
-    return undefined;
+function hasExplicitRequestCredentials(options: SimpleStreamOptions | undefined): boolean {
+  if (typeof options?.apiKey === "string" && options.apiKey.trim().length > 0) {
+    return true;
   }
-  return normalizeResolvedUpstreamAuth(entry.auth);
+  if (!options?.headers) return false;
+  return Object.entries(options.headers).some(([name, value]) => {
+    if (typeof value !== "string" || value.trim().length === 0) return false;
+    const normalizedName = name.toLowerCase();
+    return normalizedName === "authorization" || normalizedName === "x-api-key" || normalizedName === "cf-aig-authorization";
+  });
 }
 
-function rememberRequestAuth(
+async function getResolvedRegistryAuth(
   modelRegistry: any,
-  modelsMtime: number | null,
-  authMtime: number | null,
-  cacheKey: string,
-  auth: ResolvedUpstreamAuth,
-): void {
-  if (!hasUsableResolvedUpstreamAuth(auth) || routerState.currentModelRegistry !== modelRegistry) {
-    return;
+  model: Model<Api>,
+): Promise<{ auth?: ResolvedUpstreamAuth; authless?: true; error?: string }> {
+  try {
+    const auth = await modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth?.ok) {
+      return { error: auth?.error || `No API key for provider: ${model.provider}` };
+    }
+    const resolvedAuth = normalizeResolvedUpstreamAuth(auth);
+    return hasUsableResolvedUpstreamAuth(resolvedAuth)
+      ? { auth: resolvedAuth }
+      : { authless: true };
+  } catch (error) {
+    return { error: getErrorMessage(error) || `No API key for provider: ${model.provider}` };
   }
-
-  // Do not retain a result resolved by an old session or by a file revision
-  // that changed while the asynchronous auth lookup was in flight.
-  const currentModelsMtime = getFileMtimeMs(getModelsJsonPath());
-  const currentAuthMtime = getFileMtimeMs(path.join(getPiConfigDir(), "auth.json"));
-  if (currentModelsMtime !== modelsMtime || currentAuthMtime !== authMtime) {
-    syncRequestAuthCache(modelRegistry, currentModelsMtime, currentAuthMtime);
-    return;
-  }
-
-  requestAuthCache.set(cacheKey, { auth: normalizeResolvedUpstreamAuth(auth), timestamp: Date.now() });
 }
 
 /**
@@ -4935,66 +4878,85 @@ async function resolveUpstreamRequestAuth(
   }
 
   const modelRegistry = routerState.currentModelRegistry;
-  const modelsMtime = getFileMtimeMs(getModelsJsonPath());
-  const authMtime = getFileMtimeMs(path.join(getPiConfigDir(), "auth.json"));
-  syncRequestAuthCache(modelRegistry, modelsMtime, authMtime);
-  const cacheKey = getRequestAuthCacheKey(model);
-
   if (!modelRegistry) {
     return { model, options: nextOptions };
   }
 
   let registryAuthError: string | undefined;
+  let registryReportedAuthless = false;
   if (typeof modelRegistry.getApiKeyAndHeaders === "function") {
-    try {
-      const auth = await modelRegistry.getApiKeyAndHeaders(model);
-      if (auth?.ok) {
-        const resolvedAuth = normalizeResolvedUpstreamAuth(auth);
-        if (hasUsableResolvedUpstreamAuth(resolvedAuth)) {
-          rememberRequestAuth(modelRegistry, modelsMtime, authMtime, cacheKey, resolvedAuth);
-          return mergeResolvedAuth(model, nextOptions, resolvedAuth);
-        }
-        // ModelRegistry uses ok:true with no fields for providers that do not
-        // require authentication. Continue to the provider-auth path so a
-        // malformed empty result cannot hide a usable provider credential.
-      } else {
-        registryAuthError = auth?.error || `No API key for provider: ${model.provider}`;
+    const registryAtStart = modelRegistry;
+    const firstAuth = await getResolvedRegistryAuth(modelRegistry, model);
+    if (routerState.currentModelRegistry !== registryAtStart) {
+      throw new Error(`Registry auth temporarily unavailable for ${model.provider}: session registry changed`);
+    }
+    if (firstAuth.auth) {
+      return mergeResolvedAuth(model, nextOptions, firstAuth.auth);
+    }
+    registryReportedAuthless = firstAuth.authless === true;
+    if (firstAuth.error) {
+      registryAuthError = firstAuth.error;
+      debugLog(`[pi-router] Registry auth lookup failed for ${model.provider}: ${registryAuthError}`);
+
+      // A single bounded retry handles transient runtime/credential refresh races
+      // without retaining request credentials across calls.
+      const retryAuth = await getResolvedRegistryAuth(modelRegistry, model);
+      if (routerState.currentModelRegistry !== registryAtStart) {
+        throw new Error(`Registry auth temporarily unavailable for ${model.provider}: session registry changed`);
       }
-    } catch (error) {
-      registryAuthError = getErrorMessage(error) || `No API key for provider: ${model.provider}`;
-      debugLog(`[pi-router] Registry auth lookup failed for ${model.provider}:`, error);
+      if (retryAuth.auth) {
+        debugLog(`[pi-router] Registry auth retry resolved for ${model.provider}`);
+        return mergeResolvedAuth(model, nextOptions, retryAuth.auth);
+      }
+      if (retryAuth.authless) {
+        registryReportedAuthless = true;
+        registryAuthError = undefined;
+      } else {
+        registryAuthError = retryAuth.error || registryAuthError;
+      }
     }
   }
 
-  // getApiKeyAndHeaders is a compatibility facade. Retry through the public
-  // provider-auth path so OAuth refresh, stored credentials, provider-scoped
-  // env, and auth-owned baseUrl handling remain available.
+  // The compatibility facade can collapse a successful ambient AuthResult to
+  // ok:true with no fields. Consult the provider-auth path to preserve that
+  // distinction and to recover after two transient facade failures.
   if (typeof modelRegistry.getProviderAuth === "function") {
+    let providerAuth: any;
     try {
-      const providerAuth = await modelRegistry.getProviderAuth(model.provider);
-      if (providerAuth) {
-        const resolvedAuth = normalizeResolvedUpstreamAuth({
-          ...(providerAuth.auth || {}),
-          ...(providerAuth.env !== undefined ? { env: providerAuth.env } : {}),
-        });
-        if (hasUsableResolvedUpstreamAuth(resolvedAuth)) {
-          debugLog(`[pi-router] Provider auth fallback resolved for ${model.provider}`);
-          rememberRequestAuth(modelRegistry, modelsMtime, authMtime, cacheKey, resolvedAuth);
-          return mergeResolvedAuth(model, nextOptions, resolvedAuth);
-        }
-        registryAuthError ||= `No API key for provider: ${model.provider}`;
-      }
+      providerAuth = await modelRegistry.getProviderAuth(model.provider);
     } catch (error) {
       registryAuthError ||= getErrorMessage(error) || `No API key for provider: ${model.provider}`;
-      debugLog(`[pi-router] Provider auth fallback failed for ${model.provider}:`, error);
+      debugLog(`[pi-router] Provider auth lookup failed for ${model.provider}:`, error);
     }
+    if (routerState.currentModelRegistry !== modelRegistry) {
+      throw new Error(`Registry auth temporarily unavailable for ${model.provider}: session registry changed`);
+    }
+    if (providerAuth) {
+      return mergeResolvedAuth(model, nextOptions, normalizeResolvedUpstreamAuth({
+        ...(providerAuth.auth || {}),
+        ...(providerAuth.env !== undefined ? { env: providerAuth.env } : {}),
+      }));
+    }
+    if (registryReportedAuthless) {
+      // On current Pi versions, getProviderAuth() is the authoritative way to
+      // distinguish a genuinely authless/ambient success from the facade's
+      // lossy empty ok:true compatibility result.
+      registryReportedAuthless = false;
+      registryAuthError ||= `No API key for provider: ${model.provider}`;
+    }
+  } else if (registryReportedAuthless) {
+    // Preserve compatibility with older registries that only expose the facade.
+    return { model, options: nextOptions };
   }
 
   if (registryAuthError) {
-    const cachedAuth = getRecentRequestAuth(cacheKey);
-    if (cachedAuth) {
-      debugLog(`[pi-router] Reusing recent resolved auth for ${model.provider} after registry auth failure`);
-      return mergeResolvedAuth(model, nextOptions, cachedAuth);
+    // Registry resolution may still supplement explicit credentials with
+    // configured headers, environment, or an auth-owned endpoint. If all
+    // registry paths fail, preserve the caller-supplied credential rather than
+    // rejecting it; only the router provider's dummy key was removed above.
+    if (hasExplicitRequestCredentials(nextOptions)) {
+      debugLog(`[pi-router] Registry auth unavailable for ${model.provider}; using explicit request credentials`);
+      return { model, options: nextOptions };
     }
 
     // Do not invoke a raw provider with no credentials after the registry has
@@ -5004,9 +4966,10 @@ async function resolveUpstreamRequestAuth(
     throw new Error(registryAuthError);
   }
 
-  // No auth method reported a failure. This is the intentional authless-provider
-  // path (or a legacy registry without the newer auth APIs).
-  return { model, options: nextOptions };
+  // A registry that cannot resolve authentication must not cause a guaranteed
+  // unauthenticated raw-provider request. Explicit credentials returned above;
+  // legacy authless facades are handled by their ok:true branch.
+  throw new Error(`No API key for provider: ${model.provider}`);
 }
 
 async function applyUpstreamRequestAuth(
@@ -6293,8 +6256,7 @@ function __testResetInternalState(): void {
   routerState.currentSessionHash = undefined;
   routerState.currentRouterModelId = undefined;
   routerState.currentGetContextUsage = undefined;
-  setCurrentModelRegistry(undefined);
-  clearRequestAuthCache();
+  routerState.currentModelRegistry = undefined;
   routerState.customFooterInstalled = undefined;
   routerState.customFooterEnabled = undefined;
   routerState.footerStatusLineEnabled = undefined;
@@ -6352,7 +6314,6 @@ function __testSetPiConfigDir(configDir: string | null): void {
   cachedModelMapRegistryRef = null;
   cachedModelMapModelsMtime = null;
   cachedModelMapAuthMtime = null;
-  clearRequestAuthCache();
   fileHashCache.clear();
   configFileMtimeMs = null;
   currentRouterConfig = null;
@@ -6388,7 +6349,7 @@ function __testGetCachedModelMap(modelRegistry?: any): Map<string, PiModel> {
 }
 
 function __testSetCurrentModelRegistry(modelRegistry: any): void {
-  setCurrentModelRegistry(modelRegistry);
+  routerState.currentModelRegistry = modelRegistry;
 }
 
 function __testGetConfigurableModels(modelRegistry?: any, forceRefresh = false): PiModel[] {
