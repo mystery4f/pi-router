@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Transient request authentication**: treat empty auth containers as unresolved, retain a short-lived last-known-good auth result only within the active model registry and unchanged model/auth files, invalidate it on session or file changes, and refuse unauthenticated dispatch after an explicit registry auth failure.
+
+### Tests
+
+- Added regression coverage for config writes, transient registry failures, empty auth results, provider-dispatch prevention, registry replacement, and auth-file invalidation.
+
 ## [0.5.2] - 2026-09-01
 
 ### Fixed

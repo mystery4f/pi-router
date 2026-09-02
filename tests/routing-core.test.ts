@@ -8,6 +8,7 @@ import routerExtension, {
   __testGetInternalState,
   __testResetInternalState,
   __testRegisterRoutingAdapter,
+  __testSaveConfig,
   __testSetCurrentModelRegistry,
   __testSetPiConfigDir,
   canAttemptChannel,
@@ -1575,21 +1576,181 @@ describe('auth fallback (transient registry failures after reload)', () => {
     }
   });
 
-  it('falls back without a dummy key when provider auth is unavailable', async () => {
+  it('fails accurately without a dummy key when provider auth is unavailable', async () => {
     __testSetCurrentModelRegistry({
       getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'registry auth temporarily unavailable' }),
       getProviderAuth: async () => undefined,
+    });
+    try {
+      await expect(applyUpstreamRequestAuth(
+        { id: 'm1', name: 'm1', provider: 'zhipu', api: 'openai-completions' } as any,
+        { apiKey: 'router' } as any,
+      )).rejects.toThrow('registry auth temporarily unavailable');
+    } finally {
+      __testSetCurrentModelRegistry(undefined);
+    }
+  });
+
+  it('does not treat empty auth containers as resolved credentials', async () => {
+    let providerAuthCalls = 0;
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: true as const, headers: {}, env: {} }),
+      getProviderAuth: async () => {
+        providerAuthCalls++;
+        return { auth: { apiKey: 'fallback-key' } };
+      },
     });
     try {
       const options = await applyUpstreamRequestAuth(
         { id: 'm1', name: 'm1', provider: 'zhipu', api: 'openai-completions' } as any,
         { apiKey: 'router' } as any,
       );
-      expect(options).toBeDefined();
-      expect((options as any).apiKey).toBeUndefined();
+      expect(providerAuthCalls).toBe(1);
+      expect((options as any).apiKey).toBe('fallback-key');
     } finally {
       __testSetCurrentModelRegistry(undefined);
     }
+  });
+
+  it('does not dispatch to a provider after required auth resolution fails', async () => {
+    let providerCalls = 0;
+    __testSetCurrentModelRegistry({
+      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'No API key for provider: provider-a' }),
+      getProviderAuth: async () => undefined,
+      getProvider: () => ({
+        streamSimple: () => {
+          providerCalls++;
+          const stream = createAssistantMessageEventStream();
+          queueMicrotask(() => {
+            stream.push({
+              type: 'error',
+              reason: 'error',
+              error: { errorMessage: 'unexpected provider dispatch' },
+            } as any);
+            stream.end();
+          });
+          return stream;
+        },
+      }),
+    });
+    try {
+      const stream = createFailoverStream(
+        'm1',
+        ['provider-a'],
+        { messages: [] } as any,
+        undefined,
+        {} as any,
+        { id: 'm1', channels: ['provider-a'] } as any,
+        new Map([
+          ['m1@provider-a', { id: 'm1', name: 'Model One', provider: 'provider-a', api: 'openai-completions' }],
+        ]) as any,
+      );
+      const events: any[] = [];
+      for await (const event of stream) events.push(event);
+
+      expect(providerCalls).toBe(0);
+      expect(__testGetInternalState().failures.get('m1')?.[0]?.error).toContain('No API key for provider');
+      expect(events.some(event => getStreamEventFailure(event)?.includes('认证不可用'))).toBe(true);
+    } finally {
+      __testSetCurrentModelRegistry(undefined);
+    }
+  });
+});
+
+describe('last-known-good request auth cache', () => {
+  let testConfigDir: string;
+
+  beforeEach(() => {
+    testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-router-auth-cache-'));
+    __testSetPiConfigDir(testConfigDir);
+    fs.writeFileSync(path.join(testConfigDir, 'models.json'), '{}');
+    fs.writeFileSync(path.join(testConfigDir, 'auth.json'), '{}');
+  });
+
+  afterEach(() => {
+    __testSetPiConfigDir(null);
+    fs.rmSync(testConfigDir, { recursive: true, force: true });
+  });
+
+  it('reuses recent auth after a router config write and transient registry failure', async () => {
+    let unavailable = false;
+    const registry = {
+      getApiKeyAndHeaders: async () => unavailable
+        ? { ok: false as const, error: 'registry auth temporarily unavailable' }
+        : { ok: true as const, apiKey: 'stable-key' },
+      getProviderAuth: async () => undefined,
+    };
+    __testSetCurrentModelRegistry(registry);
+
+    const first = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect((first as any).apiKey).toBe('stable-key');
+
+    __testSaveConfig({
+      auto: false,
+      sticky: true,
+      stickyRecords: {},
+      models: [{ id: 'm1', channels: ['provider-a'] }],
+    } as any);
+    unavailable = true;
+
+    const second = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect((second as any).apiKey).toBe('stable-key');
+  });
+
+  it('invalidates recent auth when auth.json changes', async () => {
+    let unavailable = false;
+    const registry = {
+      getApiKeyAndHeaders: async () => unavailable
+        ? { ok: false as const, error: 'registry auth temporarily unavailable' }
+        : { ok: true as const, apiKey: 'stable-key' },
+      getProviderAuth: async () => undefined,
+    };
+    __testSetCurrentModelRegistry(registry);
+
+    await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+
+    const authPath = path.join(testConfigDir, 'auth.json');
+    fs.writeFileSync(authPath, '{}');
+    const changedAt = new Date(Date.now() + 2000);
+    fs.utimesSync(authPath, changedAt, changedAt);
+    unavailable = true;
+
+    await expect(applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    )).rejects.toThrow('registry auth temporarily unavailable');
+  });
+
+  it('invalidates recent auth when the session registry changes', async () => {
+    const firstRegistry = {
+      getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: 'first-key' }),
+      getProviderAuth: async () => undefined,
+    };
+    const secondRegistry = {
+      getApiKeyAndHeaders: async () => ({ ok: false as const, error: 'second registry unavailable' }),
+      getProviderAuth: async () => undefined,
+    };
+
+    __testSetCurrentModelRegistry(firstRegistry);
+    await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+
+    __testSetCurrentModelRegistry(secondRegistry);
+    await expect(applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    )).rejects.toThrow('second registry unavailable');
   });
 });
 
