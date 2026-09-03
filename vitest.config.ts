@@ -35,10 +35,16 @@ function resolvePiPackageRoot(): string {
   const configured = process.env.PI_ROUTER_TEST_PI_ROOT;
   if (configured) return configured;
 
-  const piBin = process.platform === 'win32'
+  const piBinLines = (process.platform === 'win32'
     ? commandOutput('where', ['pi'])
-    : commandOutput('which', ['pi']);
-  const packageRoot = piBin ? findPackageRoot(realpathSync(piBin)) : undefined;
+    : commandOutput('which', ['pi']))?.split(/\r?\n/) ?? [];
+  let packageRoot: string | undefined;
+  for (const line of piBinLines) {
+    const candidate = line.trim();
+    if (!candidate || !existsSync(candidate)) continue;
+    packageRoot = findPackageRoot(realpathSync(candidate));
+    if (packageRoot) break;
+  }
   if (packageRoot) return packageRoot;
 
   const voltaPiBin = commandOutput('volta', ['which', 'pi']);
