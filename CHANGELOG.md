@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Transient request authentication**: treat empty compatibility-facade auth containers as unresolved on current registries, retry model-aware authentication once before consulting Pi's provider-auth path, preserve valid ambient and explicit request authentication, and fail closed instead of dispatching without resolved credentials.
-- **Duplicate extension diagnostics and footer context**: identify extension instances in debug output, keep authenticated registry state when footer events omit it, and report the package version dynamically so duplicate module evaluation can be diagnosed accurately.
+- **Duplicate extension isolation**: register the `router` provider and routing adapter only from `session_start`, so later bootstrap/headless evaluations cannot replace the authenticated session instance. Keep authenticated registry state when partial footer events omit it, identify module instances in debug output, and report the package version dynamically.
 
 ### Tests
 

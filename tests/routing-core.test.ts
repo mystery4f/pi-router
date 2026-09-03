@@ -1961,17 +1961,17 @@ describe('extension reload lifecycle', () => {
     };
   }
 
-  it('replaces the bootstrap provider with the session-bound provider and unregisters it on reload', async () => {
+  it('registers providers only after session_start and unregisters them on shutdown', async () => {
     const harness = createExtensionHarness();
     routerExtension(harness.pi);
-    const bootstrapProvider = harness.providers.get('router');
-    expect(bootstrapProvider).toBeDefined();
+
+    expect(harness.providers.has('router')).toBe(false);
+    expect(harness.providerEvents).toEqual([]);
 
     await harness.emit('session_start', createSessionContext('session-a-key'));
 
-    expect(harness.providerEvents.slice(-2)).toEqual(['unregister:router', 'register:router']);
+    expect(harness.providerEvents).toEqual(['unregister:router', 'register:router']);
     expect(harness.providers.get('router')).toBeDefined();
-    expect(harness.providers.get('router')).not.toBe(bootstrapProvider);
 
     await harness.emit('session_shutdown');
 
@@ -1979,14 +1979,38 @@ describe('extension reload lifecycle', () => {
     expect(harness.providerEvents.at(-1)).toBe('unregister:router');
   });
 
+  it('does not let a late session-less duplicate replace the active provider or routing adapter', async () => {
+    const sharedProviders = new Map<string, any>();
+    const session = createExtensionHarness();
+    session.pi.registerProvider = (name: string, config: any) => sharedProviders.set(name, config);
+    session.pi.unregisterProvider = (name: string) => sharedProviders.delete(name);
+    routerExtension(session.pi);
+    await session.emit('session_start', createSessionContext('session-a-key'));
+    const activeProvider = sharedProviders.get('router');
+    const routingRegistry = (globalThis as any)[Symbol.for('pi.routing.registry.v1')];
+    const activeAdapter = routingRegistry.getRouter('router');
+
+    const duplicate = createExtensionHarness();
+    duplicate.pi.registerProvider = (name: string, config: any) => sharedProviders.set(name, config);
+    duplicate.pi.unregisterProvider = (name: string) => sharedProviders.delete(name);
+    routerExtension(duplicate.pi);
+
+    expect(duplicate.providerEvents).toEqual([]);
+    expect(sharedProviders.get('router')).toBe(activeProvider);
+    expect(routingRegistry.getRouter('router')).toBe(activeAdapter);
+
+    await session.emit('session_shutdown');
+  });
+
   it('drops stale session references and routing adapters before the replacement instance starts', async () => {
     const first = createExtensionHarness();
     routerExtension(first.pi);
     const routingRegistry = (globalThis as any)[Symbol.for('pi.routing.registry.v1')];
-    const firstAdapter = routingRegistry.getRouter('router');
-    expect(firstAdapter).toBeDefined();
+    expect(routingRegistry.getRouter('router')).toBeUndefined();
 
     await first.emit('session_start', createSessionContext('session-a-key'));
+    const firstAdapter = routingRegistry.getRouter('router');
+    expect(firstAdapter).toBeDefined();
     const authenticated = await applyUpstreamRequestAuth(
       { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
       { apiKey: 'router' } as any,
@@ -2004,11 +2028,12 @@ describe('extension reload lifecycle', () => {
 
     const second = createExtensionHarness();
     routerExtension(second.pi);
+    expect(routingRegistry.getRouter('router')).toBeUndefined();
+
+    await second.emit('session_start', createSessionContext('session-b-key'));
     const secondAdapter = routingRegistry.getRouter('router');
     expect(secondAdapter).toBeDefined();
     expect(secondAdapter).not.toBe(firstAdapter);
-
-    await second.emit('session_start', createSessionContext('session-b-key'));
     const replacementAuth = await applyUpstreamRequestAuth(
       { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
       { apiKey: 'router' } as any,
@@ -2037,17 +2062,20 @@ describe('extension reload lifecycle', () => {
     expect(authenticated?.apiKey).toBe('session-a-key');
   });
 
-  it('falls back to the last-known registry when the current reference is lost mid-session, but not after shutdown', async () => {
+  it('does not reuse or reconstruct credentials after the active registry is released', async () => {
+    fs.writeFileSync(path.join(testConfigDir, 'auth.json'), JSON.stringify({
+      'provider-a': { type: 'api_key', key: 'must-not-be-read-directly' },
+    }));
     const harness = createExtensionHarness();
     routerExtension(harness.pi);
     await harness.emit('session_start', createSessionContext('session-a-key'));
 
     __testSetCurrentModelRegistry(undefined);
-    const rescued = await applyUpstreamRequestAuth(
+    const withoutRegistry = await applyUpstreamRequestAuth(
       { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
       { apiKey: 'router' } as any,
     );
-    expect(rescued?.apiKey).toBe('session-a-key');
+    expect(withoutRegistry?.apiKey).toBeUndefined();
 
     await harness.emit('session_shutdown');
     const afterShutdown = await applyUpstreamRequestAuth(
@@ -2055,23 +2083,6 @@ describe('extension reload lifecycle', () => {
       { apiKey: 'router' } as any,
     );
     expect(afterShutdown?.apiKey).toBeUndefined();
-  });
-
-  it('resolves provider keys from auth.json when no registry is available at all', async () => {
-    fs.writeFileSync(path.join(testConfigDir, 'auth.json'), JSON.stringify({
-      'provider-a': { type: 'api_key', key: 'from-auth-json' },
-    }));
-    const harness = createExtensionHarness();
-    routerExtension(harness.pi);
-    // No session_start: simulates invocations where the event never fires or
-    // carries no registry, so neither current nor last-known registry exists.
-    __testSetCurrentModelRegistry(undefined);
-
-    const authenticated = await applyUpstreamRequestAuth(
-      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
-      { apiKey: 'router' } as any,
-    );
-    expect(authenticated?.apiKey).toBe('from-auth-json');
   });
 
   it('rebinds footer session stats from registry-less contexts but never the registry', async () => {
