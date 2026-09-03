@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-03
+
 ### Fixed
 
 - **Transient request authentication**: treat empty compatibility-facade auth containers as unresolved on current registries, retry model-aware authentication once before consulting Pi's provider-auth path, preserve valid ambient and explicit request authentication, and fail closed instead of dispatching without resolved credentials.
