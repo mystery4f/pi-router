@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-03
+
+### Fixed
+
+- **Auth survives session lifecycle races**: `session_shutdown` cleanup could leave request-time auth resolution running with no model registry (`currentModelRegistry` undefined), so every channel failed with `No API key for provider: ...` until `/reload`. Upstream auth resolution and provider lookup now fall back to the last-known registry from the same process (gated on real shutdown), footer-driven context updates only rebind the authenticated registry when the event actually carries one, and direct `auth.json` key resolution covers invocations where no registry is ever captured. A warning is logged whenever a fallback engages.
+- **Silent auth skip is now observable**: the no-registry early return in upstream auth resolution logs a diagnostic line instead of failing silently 8ms later with `No API key for provider`.
+- **Startup banner reads the version from package.json** instead of a hardcoded string (the stale `v0.5.0` banner kept appearing after 0.5.1/0.5.2 and misled issue triage).
+- **Debug logs identify the emitting instance**: every debug line is now tagged with `pid<N>#<instance-seq>` (process id + per-process instance sequence), so multi-instance routing (bootstrap vs session-bound vs headless invocations appending to the same log) can actually be attributed.
+
 ## [0.5.2] - 2026-09-01
 
 ### Fixed

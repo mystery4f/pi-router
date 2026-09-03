@@ -1,5 +1,5 @@
 /**
- * pi-router v0.5.0
+ * pi-router
  * Intelligent routing layer for pi coding agent
  *
  * Routes channels (same model, different providers) with optional fallback models.
@@ -14,6 +14,7 @@ import type { Model, Api, Context, SimpleStreamOptions, AssistantMessage, Assist
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { fileURLToPath } from "url";
 import { runConfigOrderWizard, runConfigWizard } from "./config-wizard-flow.js";
 import {
   getModelRouteEntries,
@@ -34,9 +35,72 @@ const DEFAULT_ROUTER_MAX_TOKENS = Number(process.env.PI_ROUTER_MAX_TOKENS || 327
 const PI_ROUTING_REGISTRY = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS = Symbol.for("pi.cache.hints.v1");
 
+// Every extension instance (bootstrap, session-bound, headless child process)
+// appends to the same debug log. Tag each line with the OS pid and a
+// per-process instance sequence (shared across module instances via the
+// global symbol registry) so multi-instance routing can actually be debugged.
+const INSTANCE_TAG = (() => {
+  const seqKey = Symbol.for("pi-router.instance-seq");
+  const globalRecord = globalThis as Record<PropertyKey, unknown>;
+  const seq = (typeof globalRecord[seqKey] === "number" ? (globalRecord[seqKey] as number) : 0) + 1;
+  globalRecord[seqKey] = seq;
+  return `pid${process.pid}#${seq}`;
+})();
+
 function debugLog(...args: unknown[]): void {
   // Console when PI_ROUTER_DEBUG=1; file under logDir when config.debug=true.
+  if (typeof args[0] === "string") {
+    args[0] = args[0].replace(/^\[pi-router\]/, `[pi-router ${INSTANCE_TAG}]`);
+  } else {
+    args = [`[pi-router ${INSTANCE_TAG}]`, ...args];
+  }
   routerDebugLog(...args);
+}
+
+// Provider ownership: in one process several extension instances can load
+// (bootstrap, session-bound runner, late duplicate). The LAST registration
+// wins in pi's model registry, so a late session-less duplicate steals
+// request routing away from the session-bound instance — the one holding
+// the UI and the authenticated registry. Requests then stream through a
+// context-less instance: no footer status, auth only via the auth.json
+// fallback. The ownership stamp lets the session-bound instance claim
+// routing and blocks later bootstrap duplicates (same process) from taking
+// over. Cross-process loads are unaffected (pid is part of the stamp).
+const PROVIDER_OWNERSHIP_KEY = Symbol.for("pi.router.provider-ownership.v1");
+
+function claimProviderOwnership(sessionBound: boolean): boolean {
+  const globalRecord = globalThis as Record<PropertyKey, unknown>;
+  const existing = globalRecord[PROVIDER_OWNERSHIP_KEY] as { pid: number; tag: string; sessionBound: boolean } | undefined;
+  if (existing && existing.pid === process.pid && existing.tag !== INSTANCE_TAG && existing.sessionBound && !sessionBound) {
+    debugLog("[pi-router] A session-bound instance already owns the router provider; skipping duplicate bootstrap registration");
+    return false;
+  }
+  const mergedSessionBound = existing?.tag === INSTANCE_TAG ? existing.sessionBound || sessionBound : sessionBound;
+  globalRecord[PROVIDER_OWNERSHIP_KEY] = { pid: process.pid, tag: INSTANCE_TAG, sessionBound: mergedSessionBound };
+  return true;
+}
+
+function releaseProviderOwnership(): void {
+  const globalRecord = globalThis as Record<PropertyKey, unknown>;
+  const existing = globalRecord[PROVIDER_OWNERSHIP_KEY] as { pid: number; tag: string } | undefined;
+  if (existing && existing.pid === process.pid && existing.tag !== INSTANCE_TAG) {
+    debugLog("[pi-router] Keeping provider ownership with the owning instance");
+    return;
+  }
+  delete globalRecord[PROVIDER_OWNERSHIP_KEY];
+}
+
+// Read the version from package.json at runtime so the startup banner cannot
+// drift from the published version (a hardcoded banner previously kept
+// printing v0.5.0 after 0.5.1/0.5.2 and misled issue triage).
+function resolveRouterVersion(): string {
+  try {
+    const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as { version?: string };
+    return pkg.version || "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 type PiModel = {
@@ -2305,20 +2369,36 @@ function refreshFooterContext(ctx: any, thinkingLevel?: string): void {
   routerState.currentModel = ctx.model;
   routerState.currentModelProvider = ctx.model?.provider;
   routerState.currentThinkingLevel = thinkingLevel;
-  routerState.currentSessionManager = ctx.sessionManager;
-  routerState.currentSessionHash = getSessionHashFromManager(ctx.sessionManager);
-  routerState.currentGetContextUsage = typeof ctx.getContextUsage === "function" ? () => ctx.getContextUsage() : undefined;
+  // Footer stats bind from any context that carries them, independent of the
+  // model registry: footer-driving events (turn_start, message_update,
+  // /router commands, ...) may omit the registry but still carry the live
+  // session, and the stats line (tokens, context %) must keep following it.
+  if (ctx.sessionManager) {
+    routerState.currentSessionManager = ctx.sessionManager;
+    routerState.currentSessionHash = getSessionHashFromManager(ctx.sessionManager);
+  }
+  if (typeof ctx.getContextUsage === "function") {
+    routerState.currentGetContextUsage = () => ctx.getContextUsage();
+  }
+  // The authenticated registry, however, must only be rebound from a context
+  // that actually carries one — registry-less contexts silently nulling it
+  // made every routed request fail with "No API key for provider: ..."
+  // until /reload.
+  if (!ctx.modelRegistry) return;
   routerState.currentModelRegistry = ctx.modelRegistry;
+  lastKnownModelRegistry = ctx.modelRegistry;
 }
 
 function ensureRouterFooterInstalled(): void {
   const ui = routerState.currentUi;
   if (!ui?.setFooter || routerState.customFooterInstalled || !routerState.customFooterEnabled) {
+    debugLog(`[pi-router] ensureRouterFooterInstalled: skip (setFooter=${ui?.setFooter ? "yes" : "no"}, installed=${routerState.customFooterInstalled ? "yes" : "no"}, enabled=${routerState.customFooterEnabled ? "yes" : "no"})`);
     return;
   }
 
   ui.setFooter(createRouterFooterComponent);
   routerState.customFooterInstalled = true;
+  debugLog("[pi-router] ensureRouterFooterInstalled: custom footer installed");
   ui.setStatus?.("pi-router", undefined);
   ui.setStatus?.("pi-router-right", undefined);
 }
@@ -2339,6 +2419,7 @@ function applyFooterStatus(): void {
   const ui = routerState.currentUi;
 
   if (!ui || !status || routerState.currentModelProvider !== "router") {
+    debugLog(`[pi-router] applyFooterStatus: hide (ui=${ui ? "yes" : "no"}, status=${status ? status.phase : "none"}, provider=${routerState.currentModelProvider ?? "(none)"})`);
     restoreDefaultFooter();
     ui?.setStatus?.("pi-router", undefined);
     ui?.setStatus?.("pi-router-right", undefined);
@@ -2385,7 +2466,13 @@ let routerHandlerRef: ((args: string, ctx: any) => Promise<void>) | null = null;
 export default function (pi: ExtensionAPI) {
   const config = setCurrentRouterConfig(loadConfig());
   configFileMtimeMs = getFileMtimeMs(getRouterConfigPath());
-  registerRoutingAdapter();
+  // Bootstrap registration only claims ownership when no session-bound
+  // instance already owns routing in this process: late duplicate loads must
+  // not steal the provider binding away from the session.
+  const ownsProvider = claimProviderOwnership(false);
+  if (ownsProvider) {
+    registerRoutingAdapter();
+  }
 
   // Check if we have configured models
   const hasConfiguredModels = config.models && config.models.length > 0;
@@ -2434,7 +2521,7 @@ export default function (pi: ExtensionAPI) {
     if (!currentModels) {
       currentModels = loadModelsJson();
     }
-    registerRouterProvider(pi, config, currentModels);
+    registerRouterProvider(pi, config, currentModels, false);
   } else {
     debugLog("[pi-router] No models configured yet. Waiting for session_start auto-discovery or configuration.");
   }
@@ -2478,7 +2565,7 @@ export default function (pi: ExtensionAPI) {
       }, 1000);
     }
   };
-  debugLog("[pi-router] Extension loaded (v0.5.0)");
+  debugLog(`[pi-router] Extension loaded (v${resolveRouterVersion()})`);
   debugLog("[pi-router] Strategy:", config.strategy ?? "channelFirst");
   debugLog("[pi-router] Configured models:", config.models?.length ?? 0);
   
@@ -2494,6 +2581,8 @@ export default function (pi: ExtensionAPI) {
   // Remember the active UI context so routing code can update the footer during
   // the same turn, not only at the next turn_start.
   pi.on("session_start", async (_event, ctx) => {
+    shutdownObserved = false;
+    debugLog(`[pi-router] session_start received (modelRegistry=${ctx?.modelRegistry ? "present" : "missing"})`);
     let currentConfig = refreshConfigFromDisk(config);
     updateFooterContext(ctx);
 
@@ -2533,7 +2622,7 @@ export default function (pi: ExtensionAPI) {
         ? registryModels
         : (currentModels || loadModelsJson());
       currentModels = modelsForRegistration;
-      registerRouterProvider(pi, currentConfig, modelsForRegistration);
+      registerRouterProvider(pi, currentConfig, modelsForRegistration, true);
     }
 
     scheduleSessionResources(currentConfig);
@@ -2543,6 +2632,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     clearSessionResources();
+    releaseProviderOwnership();
     restoreDefaultFooter();
     pi.unregisterProvider("router");
     routerState.unregisterRoutingAdapter?.();
@@ -2559,6 +2649,8 @@ export default function (pi: ExtensionAPI) {
     routerState.currentRouterModelId = undefined;
     routerState.currentGetContextUsage = undefined;
     routerState.currentModelRegistry = undefined;
+    shutdownObserved = true;
+    lastKnownModelRegistry = null;
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -3165,6 +3257,20 @@ async function routerHandler(args: string, ctx: any): Promise<void> {
     lines.push(`  model.id: ${ctx.model?.id || "(none)"}`);
     lines.push("");
 
+    // Extension footer bookkeeping
+    lines.push("Footer Bookkeeping:");
+    lines.push(`  customFooterInstalled: ${routerState.customFooterInstalled ? "yes" : "no"}`);
+    lines.push(`  customFooterEnabled: ${routerState.customFooterEnabled ? "yes" : "no"}`);
+    lines.push(`  footerStatusLineEnabled: ${routerState.footerStatusLineEnabled ? "yes" : "no"}`);
+    lines.push(`  currentUi: ${routerState.currentUi ? (typeof routerState.currentUi.setFooter === "function" ? "present (setFooter ok)" : "present (no setFooter)") : "(none)"}`);
+    lines.push(`  currentModelProvider: ${routerState.currentModelProvider || "(none)"}`);
+    lines.push(`  currentSessionManager: ${routerState.currentSessionManager ? "present" : "(none)"}`);
+    lines.push(`  currentGetContextUsage: ${routerState.currentGetContextUsage ? "present" : "(none)"}`);
+    lines.push(`  currentModelRegistry: ${routerState.currentModelRegistry ? "present" : "(none)"}`);
+    lines.push(`  lastKnownModelRegistry: ${lastKnownModelRegistry ? "present" : "(none)"}`);
+    lines.push(`  shutdownObserved: ${shutdownObserved ? "yes" : "no"}`);
+    lines.push("");
+
     // Expected footer
     if (status && ctx.model?.provider === "router") {
       lines.push("Expected Footer:");
@@ -3751,8 +3857,12 @@ function createMirrorModels(
 function registerRouterProvider(
   pi: ExtensionAPI,
   config: RouterConfig,
-  allModels: PiModel[]
+  allModels: PiModel[],
+  sessionBound = false
 ): void {
+  if (!claimProviderOwnership(sessionBound)) {
+    return;
+  }
   const configuredModels = config.models || [];
 
   if (configuredModels.length === 0) {
@@ -4800,6 +4910,52 @@ function mergeResolvedAuth(
   };
 }
 
+// Last-resort credential resolution: pi's model registry reads auth.json, so
+// when no registry is available at all (lifecycle races, or invocations whose
+// session_start never fires/completes), resolve the provider key directly
+// from the same file instead of emitting a request that fails 8ms later with
+// "No API key for provider: ...". Key values are never logged.
+let authJsonApiKeyCache: { mtime: number | null; data: Record<string, { type?: string; key?: string }> | undefined } | null = null;
+
+function readAuthJsonApiKey(provider: string): string | undefined {
+  try {
+    const authPath = path.join(getPiConfigDir(), "auth.json");
+    const mtime = getFileMtimeMs(authPath);
+    if (!authJsonApiKeyCache || authJsonApiKeyCache.mtime !== mtime) {
+      authJsonApiKeyCache = {
+        mtime,
+        data: JSON.parse(fs.readFileSync(authPath, "utf-8")),
+      };
+    }
+    const entry = authJsonApiKeyCache.data?.[provider];
+    return entry && typeof entry.key === "string" && entry.key.length > 0 ? entry.key : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Last-known-good registry captured at session_start. `session_shutdown`
+// nulls routerState.currentModelRegistry, but pi can run that cleanup while
+// this extension instance is still serving requests (observed as all-channel
+// "No API key for provider: ..." until /reload, with no auth-resolution debug
+// lines in the router log). Request-time auth resolution falls back to the
+// last-known registry from the same process so auth survives the race.
+let lastKnownModelRegistry: any = null;
+// Set when this runtime's own session_shutdown fired; the last-known-registry
+// fallback in getActiveModelRegistry must not resurrect auth for a session
+// that was really torn down (release hygiene asserted by the reload tests).
+let shutdownObserved = false;
+
+function getActiveModelRegistry(): any {
+  const current = routerState.currentModelRegistry;
+  if (current) return current;
+  if (!shutdownObserved && lastKnownModelRegistry) {
+    debugLog("[pi-router] currentModelRegistry is undefined at request time; using last-known registry (session context race?)");
+    return lastKnownModelRegistry;
+  }
+  return undefined;
+}
+
 async function resolveUpstreamRequestAuth(
   model: Model<Api>,
   options: SimpleStreamOptions | undefined,
@@ -4815,8 +4971,14 @@ async function resolveUpstreamRequestAuth(
     delete nextOptions.apiKey;
   }
 
-  const modelRegistry = routerState.currentModelRegistry;
+  const modelRegistry = getActiveModelRegistry();
   if (!modelRegistry) {
+    const authJsonKey = readAuthJsonApiKey(model.provider);
+    if (authJsonKey) {
+      debugLog(`[pi-router] Resolved API key for ${model.provider} from auth.json (registry unavailable)`);
+      return mergeResolvedAuth(model, nextOptions, { apiKey: authJsonKey });
+    }
+    debugLog(`[pi-router] No model registry available; cannot resolve auth for ${model.provider}; falling back to SDK/environment auth`);
     return { model, options: nextOptions };
   }
 
@@ -4872,7 +5034,7 @@ function streamThroughProvider(
   // Since pi 0.81, the model registry exposes the effective provider object.
   // Using it preserves native/extension provider stream implementations; the
   // compat dispatcher is only a fallback for isolated tests or older embeds.
-  const provider = routerState.currentModelRegistry?.getProvider?.(model.provider);
+  const provider = getActiveModelRegistry()?.getProvider?.(model.provider);
   if (provider?.streamSimple) {
     return provider.streamSimple(model, context, options);
   }
@@ -6142,6 +6304,9 @@ function __testResetInternalState(): void {
   routerState.currentRouterModelId = undefined;
   routerState.currentGetContextUsage = undefined;
   routerState.currentModelRegistry = undefined;
+  lastKnownModelRegistry = null;
+  shutdownObserved = false;
+  delete (globalThis as Record<PropertyKey, unknown>)[PROVIDER_OWNERSHIP_KEY];
   routerState.customFooterInstalled = undefined;
   routerState.customFooterEnabled = undefined;
   routerState.footerStatusLineEnabled = undefined;
@@ -6263,6 +6428,8 @@ function __testCalculateFileHash(filePath: string): string {
 
 function __testGetInternalState() {
   return {
+    currentSessionManager: routerState.currentSessionManager,
+    currentModelRegistry: routerState.currentModelRegistry,
     activeChannels: routerState.activeChannels,
     cooldowns: routerState.cooldowns,
     failures: routerState.lastFailures,
