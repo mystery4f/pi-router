@@ -2392,7 +2392,6 @@ function refreshFooterContext(ctx: any, thinkingLevel?: string): void {
 function ensureRouterFooterInstalled(): void {
   const ui = routerState.currentUi;
   if (!ui?.setFooter || routerState.customFooterInstalled || !routerState.customFooterEnabled) {
-    debugLog(`[pi-router] ensureRouterFooterInstalled: skip (setFooter=${ui?.setFooter ? "yes" : "no"}, installed=${routerState.customFooterInstalled ? "yes" : "no"}, enabled=${routerState.customFooterEnabled ? "yes" : "no"})`);
     return;
   }
 
@@ -2414,12 +2413,22 @@ function restoreDefaultFooter(): void {
   ui.setStatus?.("pi-router-right", undefined);
 }
 
+let lastFooterDecision = "";
+
+function logFooterDecision(decision: string): void {
+  // applyFooterStatus runs on every turn_start / message_update / routing
+  // phase change; stream transitions only or debug logs flood per chunk.
+  if (decision === lastFooterDecision) return;
+  lastFooterDecision = decision;
+  debugLog(`[pi-router] ${decision}`);
+}
+
 function applyFooterStatus(): void {
   const status = routerState.lastStatusUpdate;
   const ui = routerState.currentUi;
 
   if (!ui || !status || routerState.currentModelProvider !== "router") {
-    debugLog(`[pi-router] applyFooterStatus: hide (ui=${ui ? "yes" : "no"}, status=${status ? status.phase : "none"}, provider=${routerState.currentModelProvider ?? "(none)"})`);
+    logFooterDecision(`applyFooterStatus: hide (ui=${ui ? "yes" : "no"}, status=${status ? status.phase : "none"}, provider=${routerState.currentModelProvider ?? "(none)"})`);
     restoreDefaultFooter();
     ui?.setStatus?.("pi-router", undefined);
     ui?.setStatus?.("pi-router-right", undefined);
@@ -2432,6 +2441,7 @@ function applyFooterStatus(): void {
   if (!status) return;
 
   ensureRouterFooterInstalled();
+  logFooterDecision(`applyFooterStatus: show (${status.phase} -> ${status.channel})`);
 
   if (routerState.customFooterInstalled) {
     ui.setStatus?.("pi-router", undefined);
