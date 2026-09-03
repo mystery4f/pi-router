@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Transient request authentication**: treat empty compatibility-facade auth containers as unresolved on current registries, retry model-aware authentication once before consulting Pi's provider-auth path, preserve valid ambient and explicit request authentication, and fail closed instead of dispatching without resolved credentials.
+- **Duplicate extension diagnostics and footer context**: identify extension instances in debug output, keep authenticated registry state when footer events omit it, and report the package version dynamically so duplicate module evaluation can be diagnosed accurately.
 
 ### Tests
 
-- Added regression coverage for transient registry failures, empty compatibility results, ambient credentials, explicit request credentials, request-scoped credential resolution, registry replacement during async lookup, authless and legacy registry behavior, and provider-dispatch prevention.
+- Added regression coverage for transient registry failures, empty compatibility results, ambient credentials, explicit request credentials, request-scoped credential resolution, registry replacement during async lookup, authless and legacy registry behavior, provider-dispatch prevention, duplicate extension lifecycle behavior, footer context guards, and Windows test executable discovery.
 
 ## [0.5.2] - 2026-09-01
 

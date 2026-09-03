@@ -2016,6 +2016,85 @@ describe('extension reload lifecycle', () => {
     expect(replacementAuth?.apiKey).toBe('session-b-key');
     await second.emit('session_shutdown');
   });
+
+  it('keeps the authenticated registry when footer events deliver a context without one', async () => {
+    const harness = createExtensionHarness();
+    routerExtension(harness.pi);
+    await harness.emit('session_start', createSessionContext('session-a-key'));
+
+    // Regression: footer-driving events (turn_start/message_update/...) can
+    // deliver contexts without a model registry; refreshFooterContext used to
+    // clobber the authenticated registry, so every routed request failed with
+    // "No API key for provider: ..." until /reload.
+    const footerCtx = createSessionContext('session-a-key') as any;
+    delete footerCtx.modelRegistry;
+    await harness.emit('turn_start', footerCtx);
+
+    const authenticated = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(authenticated?.apiKey).toBe('session-a-key');
+  });
+
+  it('falls back to the last-known registry when the current reference is lost mid-session, but not after shutdown', async () => {
+    const harness = createExtensionHarness();
+    routerExtension(harness.pi);
+    await harness.emit('session_start', createSessionContext('session-a-key'));
+
+    __testSetCurrentModelRegistry(undefined);
+    const rescued = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(rescued?.apiKey).toBe('session-a-key');
+
+    await harness.emit('session_shutdown');
+    const afterShutdown = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(afterShutdown?.apiKey).toBeUndefined();
+  });
+
+  it('resolves provider keys from auth.json when no registry is available at all', async () => {
+    fs.writeFileSync(path.join(testConfigDir, 'auth.json'), JSON.stringify({
+      'provider-a': { type: 'api_key', key: 'from-auth-json' },
+    }));
+    const harness = createExtensionHarness();
+    routerExtension(harness.pi);
+    // No session_start: simulates invocations where the event never fires or
+    // carries no registry, so neither current nor last-known registry exists.
+    __testSetCurrentModelRegistry(undefined);
+
+    const authenticated = await applyUpstreamRequestAuth(
+      { id: 'm1', name: 'm1', provider: 'provider-a', api: 'openai-completions' } as any,
+      { apiKey: 'router' } as any,
+    );
+    expect(authenticated?.apiKey).toBe('from-auth-json');
+  });
+
+  it('rebinds footer session stats from registry-less contexts but never the registry', async () => {
+    const harness = createExtensionHarness();
+    routerExtension(harness.pi);
+    await harness.emit('session_start', createSessionContext('session-a-key'));
+    const before = __testGetInternalState();
+    expect(before.currentModelRegistry).toBeDefined();
+
+    // Footer-driving context without a model registry: the stats line must
+    // keep following the live session, while the authenticated registry stays
+    // untouched (this combination is what keeps the footer working after
+    // /router sticky clear without reopening the No-API-key bug).
+    const footerCtx: any = createSessionContext('session-a-key');
+    const freshSessionManager = { getSessionId: () => 'session-footer' };
+    delete footerCtx.modelRegistry;
+    footerCtx.sessionManager = freshSessionManager;
+    await harness.emit('turn_start', footerCtx);
+
+    const after = __testGetInternalState();
+    expect(after.currentSessionManager).toBe(freshSessionManager);
+    expect(after.currentModelRegistry).toBe(before.currentModelRegistry);
+  });
 });
 
 describe('resetRoutingPointer', () => {
